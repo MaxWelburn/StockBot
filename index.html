@@ -207,8 +207,19 @@
     .saved-btn-main {
       display: flex;
       justify-content: space-between;
-      align-items: baseline;
+      align-items: center;
       margin-bottom: 2px;
+      gap: 4px;
+    }
+    .saved-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .saved-right {
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
     .saved-symbol {
       font-weight: 600;
@@ -225,6 +236,25 @@
     .saved-sub {
       font-size: 0.78rem;
       color: #9ca3af;
+    }
+    .saved-star {
+      font-size: 0.9rem;
+      cursor: pointer;
+      color: #6b7280;
+      user-select: none;
+    }
+    .saved-star-on {
+      color: #facc15;
+    }
+    .saved-delete {
+      font-size: 0.8rem;
+      cursor: pointer;
+      color: #6b7280;
+      user-select: none;
+      padding: 0 4px;
+    }
+    .saved-delete:hover {
+      color: #f97373;
     }
     .main-panel {
       flex: 1 1 auto;
