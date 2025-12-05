@@ -233,15 +233,12 @@ function renderSavedList() {
     const amount = item.last_amount || 0;
     const actionPrice = item.last_action_price || 0.0;
 
-    let decisionLabel = "Last: HOLD";
+    let decisionLabel = "HOLD";
     if ((decision === "BUY" || decision === "SELL") && amount > 0) {
       const priceStr =
         actionPrice > 0 ? ` @ $${actionPrice.toFixed(2)}` : "";
-      decisionLabel = `Last: ${decision} ${amount}${priceStr}`;
+      decisionLabel = `${decision} ${amount}${priceStr}`;
     }
-
-    const lastPriceStr =
-      item.last_price != null ? ` · Last price $${item.last_price.toFixed(2)}` : "";
 
     const starOn = item.favorite === true;
 
@@ -260,7 +257,7 @@ function renderSavedList() {
           </div>
         </div>
         <div class="saved-sub">
-          ${decisionLabel}${lastPriceStr}
+          ${decisionLabel}
         </div>
       </button>
     `;
