@@ -541,38 +541,43 @@ async function gridSearchThresholdsWithProgress(prices, startWallet, onProgress)
   if (onProgress) onProgress(100);
   return bestResult;
 }
-
-
 function updateChart(symbol, dates, prices, equityCurve) {
   if (priceChart) {
     priceChart.destroy();
   }
 
+  const p0 = prices[0];
+
+  // Blue: actual stock price (already "normalized" to its own start)
+  const stockLine = prices.slice(); // just use raw prices
+
   const datasets = [
     {
-      label: `${symbol.toUpperCase()} Close Price`,
-      data: prices,
+      label: `${symbol.toUpperCase()} Price`,
+      data: stockLine,
       borderWidth: 1.8,
       pointRadius: 0,
-      borderColor: "rgba(59,130,246,1)",        // blue line for stock price
+      borderColor: "rgba(59,130,246,1)",        // blue line
       backgroundColor: "rgba(59,130,246,0.12)", // soft blue fill
     }
   ];
 
+  // equityCurve is total value = wallet + shares * price
   if (equityCurve && equityCurve.length === prices.length) {
-    const p0 = prices[0];
     const e0 = equityCurve[0];
 
-    let normEquity = equityCurve;
-    if (e0 != null && !Number.isNaN(e0)) {
-      // shift so that equityCurve[0] == prices[0]
-      const offset = e0 - p0;
-      normEquity = equityCurve.map(v => v - offset);
-    }
+    const simNormalized = equityCurve.map(v => {
+      if (!isFinite(v) || !isFinite(e0) || e0 === 0 || !isFinite(p0) || p0 === 0) {
+        return p0;
+      }
+      // normalized to initial stock price:
+      // equity_t / equity_0 * p0
+      return (v / e0) * p0;
+    });
 
     datasets.push({
-      label: "Total value (wallet + shares, normalized)",
-      data: normEquity,
+      label: "Simulation value (normalized to initial stock price)",
+      data: simNormalized,
       borderWidth: 1.8,
       pointRadius: 0,
       borderColor: "rgba(34,197,94,1)",         // green line
