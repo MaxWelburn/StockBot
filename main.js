@@ -248,17 +248,24 @@ function renderSavedList() {
                     grid-template-columns: 1fr auto;
                     grid-auto-rows:auto;
                     row-gap:2px;">
-          <!-- row 1 -->
+        <!-- row 1 -->
           <div class="saved-symbol">${sym}</div>
-          <div class="saved-profit ${profitClass}" style="text-align:right;">
-            ${profitText}
+          <div class="saved-profit-cell"
+               style="display:flex; justify-content:flex-end; align-items:center;">
+            <span class="saved-profit ${profitClass}" style="margin-right:4px;">
+              ${profitText}
+            </span>
+            <span class="saved-delete" data-symbol="${sym}" title="Remove ${sym}">✕</span>
           </div>
-          <!-- row 2 -->
+        <!-- row 2 -->
           <div class="saved-decision" style="color:${decisionColor};">
             ${decisionLabel}
           </div>
-          <div class="saved-last-price" style="text-align:right;">
-            $${lastPrice.toFixed(2)}
+          <div class="saved-last-price-cell"
+               style="display:flex; justify-content:flex-end; align-items:center;">
+            <span class="saved-last-price" style="margin-right:14px;">
+              $${lastPrice.toFixed(2)}
+            </span>
           </div>
         </div>
       </button>
@@ -910,6 +917,21 @@ runButton.addEventListener("click", () => {
 });
 
 savedList.addEventListener("click", (e) => {
+  // If the X was clicked, delete that symbol
+  const del = e.target.closest(".saved-delete");
+  if (del) {
+    const sym = del.dataset.symbol;
+    if (sym) {
+      const saved = loadSaved();
+      delete saved[sym];
+      saveSaved(saved);
+      renderSavedList();
+    }
+    e.stopPropagation();
+    return;
+  }
+
+  // Otherwise, clicking the row runs the simulation
   const btn = e.target.closest(".saved-btn");
   if (!btn) return;
   const sym = btn.dataset.symbol;
