@@ -662,7 +662,7 @@ function updateChart(symbol, dates, prices, equityCurve) {
     const normalizedSim = equityCurve.map((v) => v * factor);
 
     datasets.push({
-      label: "Simulation value (normalized to initial stock price)",
+      label: "Simulation value",
       data: normalizedSim,
       borderWidth: 1.5,
       pointRadius: 0,
@@ -681,13 +681,27 @@ function updateChart(symbol, dates, prices, equityCurve) {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+
+      // show BOTH datasets at the hovered x-position
       interaction: {
-        mode: "nearest",
+        mode: "index",
         intersect: false
       },
+
       plugins: {
         legend: {
           labels: { color: "#e5e7eb" }
+        },
+        // format tooltip values as $ with 2 decimals for both lines
+        tooltip: {
+          mode: "index",
+          intersect: false,
+          callbacks: {
+            label: function (context) {
+              const v = context.parsed.y;
+              return `${context.dataset.label}: ${formatMoney(v, false)}`;
+            }
+          }
         },
         zoom: {
           pan: {
@@ -705,6 +719,7 @@ function updateChart(symbol, dates, prices, equityCurve) {
           }
         }
       },
+
       scales: {
         x: {
           ticks: {
@@ -714,7 +729,15 @@ function updateChart(symbol, dates, prices, equityCurve) {
         },
         y: {
           beginAtZero: false,
-          ticks: { color: "#9ca3af" }
+          ticks: {
+            color: "#9ca3af",
+            callback: function (value) {
+              const v = typeof value === "number" ? value : Number(value);
+              if (!isFinite(v)) return "";
+              const rounded = Math.round(v);      // integer
+              return "$" + rounded.toString();    // e.g. "$245"
+            }
+          }
         }
       }
     }
@@ -745,8 +768,6 @@ function saveBestResult(symbol, result) {
   saveSaved(saved);
 }
 
-
-// ================== MAIN RUN LOGIC ==================
 // ================== MAIN RUN LOGIC ==================
 async function runForInput(inputValue, { forceReoptimize = false } = {}) {
   const raw = (inputValue || "").trim();
@@ -782,7 +803,7 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     let bestResult;
 
     if (saved && !forceReoptimize) {
-      setProgress(20, "Using cached thresholds...");
+      setProgress(20, "Using cached simulations...");
 
       const sell = saved.sell_pct_thresh;
       const buy = saved.buy_pct_thresh;
@@ -891,8 +912,8 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     setStatus(
       saved && !forceReoptimize
-        ? "Done (cached thresholds, cached prices if available)."
-        : "Done."
+        ? "Done"
+        : "Done"
     );
 
   } catch (err) {
@@ -1238,7 +1259,6 @@ if (pfRunPortfolioBtn) {
   });
 }
 
-// ================== INIT ==================
 // ================== INIT ==================
 renderSavedList();
 
