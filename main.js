@@ -398,31 +398,10 @@ async function getStockData(symbol) {
   return { dates, prices };
 }
 
-// Build equity curve for chosen thresholds by re-running strategy on prefixes
-function buildEquityCurve(
-  prices,
-  sellPctThresh,
-  buyPctThresh,
-  maxLookbackDays,
-  riskMultiplier,
-  minHoldDays
-) {
-  // Run the strategy once while tracking the equity curve over time
-  const res = biasedTrader(
-    prices,
-    START_WALLET,
-    sellPctThresh,
-    buyPctThresh,
-    maxLookbackDays,
-    riskMultiplier,
-    minHoldDays,
-    true
-  );
-  return res.equity_curve || [];
-}
-
-
 // ================== TRADING SIMULATION ==================
+
+// Run the strategy once while tracking the equity curve AND
+// per-day BUY/SELL markers (for plotting on the sim line).
 function biasedTrader(
   prices,
   startWallet,
@@ -441,6 +420,8 @@ function biasedTrader(
   let lastActionPrice = 0;
 
   const equityCurve = trackCurve ? [] : null;
+  const buyMarkers = trackCurve ? [] : null;  // how many shares bought per index
+  const sellMarkers = trackCurve ? [] : null; // how many shares sold per index
 
   const rm =
     typeof riskMultiplier === "number" && isFinite(riskMultiplier) && riskMultiplier > 0
@@ -456,6 +437,8 @@ function biasedTrader(
     const totalShares0 = shares.reduce((acc, lot) => acc + lot.amount, 0);
     const totalVal0 = wallet + totalShares0 * p0;
     equityCurve.push(totalVal0);
+    buyMarkers.push(0);
+    sellMarkers.push(0);
   }
 
   for (let i = 1; i < prices.length; i++) {
@@ -464,6 +447,9 @@ function biasedTrader(
     lastDecision = "HOLD";
     lastAmount = 0;
     lastActionPrice = 0;
+
+    let dayBuy = 0;
+    let daySell = 0;
 
     // SELL lots with enough profit and that have satisfied the minimum hold time
     for (let idx = shares.length - 1; idx >= 0; idx--) {
@@ -482,6 +468,7 @@ function biasedTrader(
       if (buyPrice < price && profitPct > sellPctThresh) {
         wallet += amount * price;
         shares.splice(idx, 1);
+        daySell += amount;
         lastAmount += amount;
         lastActionPrice = price;
         lastDecision = "SELL";
@@ -518,6 +505,7 @@ function biasedTrader(
 
         if (amount > 0) {
           shares.push({ buyPrice: price, amount, buyIndex: i });
+          dayBuy += amount;
           lastAmount = amount;
           lastActionPrice = price;
           lastDecision = "BUY";
@@ -529,6 +517,8 @@ function biasedTrader(
       const totalShares = shares.reduce((acc, lot) => acc + lot.amount, 0);
       const totalVal = wallet + totalShares * price;
       equityCurve.push(totalVal);
+      buyMarkers.push(dayBuy);
+      sellMarkers.push(daySell);
     }
   }
 
@@ -537,7 +527,7 @@ function biasedTrader(
   const finalValue = wallet + totalShares * finalPrice;
   const profit = finalValue - startWallet;
 
-  return {
+  const result = {
     final_wallet: wallet,
     final_shares: shares,
     final_value: finalValue,
@@ -551,10 +541,39 @@ function biasedTrader(
     last_amount: lastAmount,
     last_action_price: lastActionPrice,
     last_price: finalPrice,
-    equity_curve: equityCurve
+    equity_curve: trackCurve ? equityCurve : null,
+    buy_markers: trackCurve ? buyMarkers : null,
+    sell_markers: trackCurve ? sellMarkers : null
   };
+
+  return result;
 }
 
+// Build equity data (curve + buy/sell markers) for best thresholds
+function buildEquityData(
+  prices,
+  sellPctThresh,
+  buyPctThresh,
+  maxLookbackDays,
+  riskMultiplier,
+  minHoldDays
+) {
+  const res = biasedTrader(
+    prices,
+    START_WALLET,
+    sellPctThresh,
+    buyPctThresh,
+    maxLookbackDays,
+    riskMultiplier,
+    minHoldDays,
+    true
+  );
+  return {
+    equityCurve: res.equity_curve || [],
+    buyMarkers: res.buy_markers || [],
+    sellMarkers: res.sell_markers || []
+  };
+}
 
 async function gridSearchThresholdsWithProgress(
   prices,
@@ -636,9 +655,7 @@ async function gridSearchThresholdsWithProgress(
   return bestResult;
 }
 
-
-// ================== CHART RENDERING ==================
-function updateChart(symbol, dates, prices, equityCurve) {
+function updateChart(symbol, dates, prices, equityCurve, buyMarkers = [], sellMarkers = []) {
   if (priceChart) {
     priceChart.destroy();
   }
@@ -655,8 +672,11 @@ function updateChart(symbol, dates, prices, equityCurve) {
     }
   ];
 
+  let normalizedSim = null;
+
   if (equityCurve && equityCurve.length === prices.length) {
-    const normalizedSim = equityCurve.map((totalVal, idx) => {
+    // scale sim value into "price space" so the line sits near the price line
+    normalizedSim = equityCurve.map((totalVal, idx) => {
       const price = prices[idx];
       if (!isFinite(totalVal) || !isFinite(price) || START_WALLET === 0) {
         return null;
@@ -673,6 +693,77 @@ function updateChart(symbol, dates, prices, equityCurve) {
       backgroundColor: "rgba(34,197,94,0.15)",
       tension: 0.15
     });
+
+    if (normalizedSim) {
+      // ONE point per day so indices line up with the main lines.
+      // Days with no trade get y = NaN so they don't draw or show in tooltips.
+      const buyPoints = dates.map((date, i) => {
+        const shares = (buyMarkers && buyMarkers[i]) || 0;
+        const y = normalizedSim[i];
+        return {
+          x: date,
+          y: shares > 0 && isFinite(y) ? y : NaN,
+          shares
+        };
+      });
+
+      const sellPoints = dates.map((date, i) => {
+        const shares = (sellMarkers && sellMarkers[i]) || 0;
+        const y = normalizedSim[i];
+        return {
+          x: date,
+          y: shares > 0 && isFinite(y) ? y : NaN,
+          shares
+        };
+      });
+
+      // BUY circles on sim line
+      datasets.push({
+        type: "scatter",
+        label: "Buys",
+        data: buyPoints,
+        showLine: false,
+        borderColor: "#22c55e",
+        backgroundColor: "#22c55e",
+        pointStyle: "circle",
+        pointRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 4 : 0;
+        },
+        pointHoverRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 6 : 0;
+        },
+        hitRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 6 : 0;
+        }
+      });
+
+      // SELL crosses – last dataset so it’s drawn on top
+      datasets.push({
+        type: "scatter",
+        label: "Sells",
+        data: sellPoints,
+        showLine: false,
+        borderColor: "#ef4444",
+        backgroundColor: "#ef4444",
+        pointStyle: "cross",
+        borderWidth: 3,      // thicker
+        pointRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 6 : 0;  // bigger cross
+        },
+        pointHoverRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 8 : 0;
+        },
+        hitRadius: ctx => {
+          const s = ctx.raw && ctx.raw.shares;
+          return s > 0 ? 8 : 0;
+        }
+      });
+    }
   }
 
   priceChart = new Chart(chartCanvas.getContext("2d"), {
@@ -685,7 +776,7 @@ function updateChart(symbol, dates, prices, equityCurve) {
       responsive: true,
       maintainAspectRatio: false,
 
-      // show BOTH datasets at the hovered x-position
+      // still show both lines at the hovered x
       interaction: {
         mode: "index",
         intersect: false
@@ -695,14 +786,51 @@ function updateChart(symbol, dates, prices, equityCurve) {
         legend: {
           labels: { color: "#e5e7eb" }
         },
-        // format tooltip values as $ with 2 decimals for both lines
         tooltip: {
           mode: "index",
           intersect: false,
+
+          displayColors: false,
+          padding: 6,
+          bodySpacing: 2,
+          boxPadding: 4,
+
+          // 👇 NEW: move tooltip to the side of the point
+          xAlign: "right",    // put the box to the right of the hover point
+          yAlign: "center",   // vertically centered
+          caretPadding: 10,   // space between point and box (tweak this if you want)
+
+          itemSort: function (a, b) {
+            const la = a.dataset.label || "";
+            const lb = b.dataset.label || "";
+            const isMarkerA = la === "Buys" || la === "Sells";
+            const isMarkerB = lb === "Buys" || lb === "Sells";
+            if (isMarkerA !== isMarkerB) return isMarkerA ? 1 : -1;
+            const ya = a.parsed && isFinite(a.parsed.y) ? a.parsed.y : -Infinity;
+            const yb = b.parsed && isFinite(b.parsed.y) ? b.parsed.y : -Infinity;
+            return yb - ya;
+          },
+
           callbacks: {
+            labelTextColor: function (context) {
+              const lbl = context.dataset.label || "";
+              if (lbl === "Simulation value") return "#22c55e";
+              if (lbl.endsWith(" Price"))    return "#3b82f6";
+              if (lbl === "Buys")            return "#22c55e";
+              if (lbl === "Sells")           return "#ef4444";
+              return "#e5e7eb";
+            },
             label: function (context) {
+              const dsLabel = context.dataset.label || "";
+              if (dsLabel === "Buys" || dsLabel === "Sells") {
+                const raw = context.raw || {};
+                const shares = raw.shares != null ? raw.shares : 0;
+                if (shares <= 0) return "";
+                const action = dsLabel === "Buys" ? "Buy" : "Sell";
+                return `${action} ${shares} shares`;
+              }
               const v = context.parsed.y;
-              return `${context.dataset.label}: ${formatMoney(v, false)}`;
+              return `${dsLabel}: ${formatMoney(v, false)}`;
             }
           }
         },
@@ -712,12 +840,8 @@ function updateChart(symbol, dates, prices, equityCurve) {
             mode: "x"
           },
           zoom: {
-            wheel: {
-              enabled: true
-            },
-            pinch: {
-              enabled: true
-            },
+            wheel: { enabled: true },
+            pinch: { enabled: true },
             mode: "x"
           }
         }
@@ -737,8 +861,8 @@ function updateChart(symbol, dates, prices, equityCurve) {
             callback: function (value) {
               const v = typeof value === "number" ? value : Number(value);
               if (!isFinite(v)) return "";
-              const rounded = Math.round(v);      // integer
-              return "$" + rounded.toString();    // e.g. "$245"
+              const rounded = Math.round(v);
+              return "$" + rounded.toString(); // integers on axis
             }
           }
         }
@@ -848,8 +972,7 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     if (!bestResult) throw new Error("No result from grid search.");
 
-    // Build equity curve for the best parameters and update chart
-    const equityCurve = buildEquityCurve(
+    const { equityCurve, buyMarkers, sellMarkers } = buildEquityData(
       prices,
       bestResult.sell_pct_thresh,
       bestResult.buy_pct_thresh,
@@ -857,7 +980,8 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
       bestResult.risk_multiplier != null ? bestResult.risk_multiplier : 1.0,
       bestResult.min_hold_days != null ? bestResult.min_hold_days : 0
     );
-    updateChart(symbol, dates, prices, equityCurve);
+
+    updateChart(symbol, dates, prices, equityCurve, buyMarkers, sellMarkers);
 
     const decision = bestResult.last_decision;
     const amount = bestResult.last_amount;
@@ -910,15 +1034,10 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     // save to localStorage
     saveBestResult(symbol, bestResult);
-    // 🔧 NEW: immediately refresh the Saved Symbols tab
+    // refresh the Saved Symbols tab
     renderSavedList();
 
-    setStatus(
-      saved && !forceReoptimize
-        ? "Done"
-        : "Done"
-    );
-
+    setStatus("Done");
   } catch (err) {
     console.error(err);
     setStatus(String(err), true);
@@ -1267,17 +1386,14 @@ renderSavedList();
 
 // Auto-run the top saved symbol (if any) when the page loads
 (function autoRunTopSaved() {
-  // Find the first saved symbol button after renderSavedList() has built the list
   const firstBtn = savedList.querySelector(".saved-btn");
-  if (!firstBtn) return; // nothing saved yet
+  if (!firstBtn) return;
 
   const sym = firstBtn.dataset.symbol;
   if (!sym) return;
 
-  // Put it into the input and run the full simulation (graph + stats)
   input.value = sym;
   runForInput(sym);
 })();
 
 input.focus();
-
