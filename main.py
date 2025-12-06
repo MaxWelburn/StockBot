@@ -267,6 +267,7 @@ def main():
             )
             decision = result["last_decision"]
             amount = result["last_amount"]
+            print(result["final_value"] - 4000)
             if decision == "BUY" and amount > 0:
                 print(f"{symbol_upper}: BUY {amount} shares")
             elif decision == "SELL" and amount > 0:

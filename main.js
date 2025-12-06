@@ -1,9 +1,11 @@
+// ================== CONSTANTS ==================
 const START_WALLET = 4000.0;
 const MAX_LOOKBACK_DAYS = 30;
 const STORAGE_KEY = "biasTraderSavedV1";
 const PRICE_CACHE_KEY = "biasTraderPriceV1";
 const NAME_MAP_KEY = "biasTraderNameMapV1";
 
+// Simple name→symbol hints
 const BUILTIN_NAME_MAP = {
   apple: "AAPL",
   "apple inc": "AAPL",
@@ -14,19 +16,24 @@ const BUILTIN_NAME_MAP = {
   google: "GOOGL",
   alphabet: "GOOGL",
   amazon: "AMZN",
+  "amazon.com": "AMZN",
   nvidia: "NVDA",
+  "nvidia corp": "NVDA",
   tesla: "TSLA",
-  netflix: "NFLX",
+  "tesla inc": "TSLA",
   adobe: "ADBE",
-  "adobe inc": "ADBE"
+  netflix: "NFLX"
 };
 
+// ================== DOM HOOKS ==================
 const form = document.getElementById("symbol-form");
 const input = document.getElementById("symbol-input");
 const runButton = document.getElementById("run-button");
+
 const statusEl = document.getElementById("status");
 const progressBar = document.getElementById("progress-bar");
 const progressText = document.getElementById("progress-text");
+
 const savedList = document.getElementById("saved-list");
 const clearSavedBtn = document.getElementById("clear-saved");
 
@@ -40,6 +47,7 @@ const profitExtra = document.getElementById("profit-extra");
 const chartCanvas = document.getElementById("chart");
 let priceChart = null;
 
+// ================== STATE / HELPERS ==================
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg || "";
   statusEl.className = "status" + (isError ? " error" : "");
@@ -51,59 +59,80 @@ function setProgress(percent, label) {
   progressText.textContent = label || `Progress: ${p}%`;
 }
 
-function clampMinMax(value, minVal, maxVal) {
-  return Math.max(minVal, Math.min(value, maxVal));
-}
-
 function todayISO() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function normalizeName(str) {
-  return str.trim().toLowerCase().replace(/[.,]/g, "");
-}
-
+// after 2pm local time?
 function isAfterDailyRefreshCutoff() {
-  // 1:35pm local time (PST for you)
   const now = new Date();
-  return now.getHours() >= 13.55;
+  return now.getHours() >= 14;
 }
 
-function loadSaved() {
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+async function fetchJson(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+function formatMoney(value, withSign = false) {
+  if (!isFinite(value)) return withSign ? "+$0.00" : "$0.00";
+  const sign = withSign ? (value >= 0 ? "+$" : "-$") : "$";
+  const abs = Math.abs(value).toFixed(2);
+  return sign + abs;
+}
+
+// ================== API KEY HANDLING ==================
+// BT8UUAJIJ09B1IQF encoded in base64
+function getIdent() {
+  const encoded = "QlQ4VVVBSklKMDlCMUlrRg==";
+  return atob(encoded);
+}
+
+// ================== LOCAL STORAGE: NAME MAP ==================
+function loadNameMap() {
+  let result = { ...BUILTIN_NAME_MAP };
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw);
-  } catch {
-    return {};
+    const raw = localStorage.getItem(NAME_MAP_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed)) {
+          result[k] = v;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to load name map:", e);
+  }
+  return result;
+}
+
+function saveNameMap(extraMap) {
+  try {
+    localStorage.setItem(NAME_MAP_KEY, JSON.stringify(extraMap));
+  } catch (e) {
+    console.warn("Failed to save name map:", e);
   }
 }
 
+// ================== LOCAL STORAGE: PRICE CACHE ==================
 function loadPriceCache() {
   try {
     const raw = localStorage.getItem(PRICE_CACHE_KEY);
     if (!raw) return {};
-    return JSON.parse(raw);
-  } catch {
-    return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch (e) {
+    console.warn("Failed to load price cache:", e);
   }
-}
-
-function loadNameMap() {
-  try {
-    const raw = localStorage.getItem(NAME_MAP_KEY);
-    if (!raw) return {};
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
-}
-
-function saveNameMapEntry(name, symbol) {
-  const norm = normalizeName(name);
-  const map = loadNameMap();
-  map[norm] = symbol.toUpperCase();
-  localStorage.setItem(NAME_MAP_KEY, JSON.stringify(map));
+  return {};
 }
 
 function getCachedPricesIfFresh(symbol) {
@@ -112,23 +141,17 @@ function getCachedPricesIfFresh(symbol) {
   const entry = cache[sym];
   if (!entry) return null;
 
-  const today = todayISO();
-  if (entry.fetch_date !== today) {
+  if (entry.fetch_date !== todayISO()) return null;
+
+  const now = new Date();
+  const afterCutoffNow = isAfterDailyRefreshCutoff();
+
+  // If it's after 1:35pm now, only use cache that was fetched after cutoff
+  if (afterCutoffNow && !entry.after_cutoff_fetch) {
     return null;
   }
 
-  // Before 2pm: use today's cache.
-  // After 2pm: only use cache if it was fetched after 2pm.
-  if (!isAfterDailyRefreshCutoff()) {
-    return { dates: entry.dates, prices: entry.prices };
-  }
-
-  if (entry.after_cutoff_fetch) {
-    return { dates: entry.dates, prices: entry.prices };
-  }
-
-  // We want a fresh call after 2pm.
-  return null;
+  return { dates: entry.dates, prices: entry.prices };
 }
 
 function savePriceCache(symbol, dates, prices) {
@@ -140,196 +163,196 @@ function savePriceCache(symbol, dates, prices) {
     prices,
     after_cutoff_fetch: isAfterDailyRefreshCutoff()
   };
-  localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+  try {
+    localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+  } catch (e) {
+    console.warn("Failed to save price cache:", e);
+  }
 }
 
-function saveBestResult(symbol, result) {
-  const sym = symbol.toUpperCase();
-  const saved = loadSaved();
-  const prev = saved[sym] || {};
-  saved[sym] = {
-    symbol: sym,
-    sell_pct_thresh: result.sell_pct_thresh,
-    buy_pct_thresh: result.buy_pct_thresh,
-    profit: result.profit,
-    final_value: result.final_value,
-    last_price: result.last_price,
-    last_updated: new Date().toISOString(),
-    last_decision: result.last_decision,
-    last_amount: result.last_amount,
-    last_action_price: result.last_action_price,
-    lookback_days: result.lookback_days || MAX_LOOKBACK_DAYS, // 🔹 NEW
-    favorite: prev.favorite === true
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
-  renderSavedList();
+// ================== LOCAL STORAGE: SAVED RESULTS ==================
+function loadSaved() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch (e) {
+    console.warn("Failed to load saved:", e);
+  }
+  return {};
 }
 
-
-function classifyItemForSort(item) {
-  const decision = item.last_decision || "HOLD";
-  const amount = item.last_amount || 0;
-  const isAction = (decision === "BUY" || decision === "SELL") && amount > 0;
-  const isStar = !!item.favorite;
-
-  // 0: starred BUY/SELL
-  // 1: BUY/SELL
-  // 2: starred HOLD
-  // 3: HOLD
-  if (isStar && isAction) return 0;
-  if (isAction && !isStar) return 1;
-  if (isStar && !isAction) return 2;
-  return 3;
+function saveSaved(obj) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
+  } catch (e) {
+    console.warn("Failed to save:", e);
+  }
 }
 
+// 2×2 grid saved list: symbol / profit on first row, decision / last price on second row
 function renderSavedList() {
   const saved = loadSaved();
-  let symbols = Object.keys(saved);
+  const symbols = Object.keys(saved);
 
   if (!symbols.length) {
     savedList.innerHTML =
-      '<div class="saved-empty">No saved symbols yet. Run one to add it.</div>';
+      '<div class="saved-empty">No saved symbols yet. Run a simulation to save one.</div>';
     return;
   }
 
-  symbols.sort((a, b) => {
-    const itemA = saved[a];
-    const itemB = saved[b];
+  const records = symbols.map((sym) => saved[sym]);
 
-    const catA = classifyItemForSort(itemA);
-    const catB = classifyItemForSort(itemB);
-    if (catA !== catB) return catA - catB;
+  // Mark BUY/SELL with amount vs HOLD
+  records.forEach((rec) => {
+    const dec = rec.last_decision || "HOLD";
+    const amt = rec.last_amount || 0;
+    rec._isAction = (dec === "BUY" || dec === "SELL") && amt > 0;
+  });
 
-    // BUY/SELL groups (0 and 1): sort by last_amount desc
-    if (catA === 0 || catA === 1) {
-      const amtA = itemA.last_amount || 0;
-      const amtB = itemB.last_amount || 0;
-      if (amtA !== amtB) {
-        return amtB - amtA; // bigger trades first
-      }
-      return a.localeCompare(b);
-    }
-
-    // HOLD groups (2 and 3): sort by profit desc
-    if (catA === 2 || catA === 3) {
-      const pA = itemA.profit || 0;
-      const pB = itemB.profit || 0;
-      if (pA !== pB) {
-        return pB - pA; // more profit first
-      }
-      return a.localeCompare(b);
-    }
-
-    return a.localeCompare(b);
+  // BUY/SELL first, then HOLD, within each: highest profit first
+  records.sort((a, b) => {
+    if (a._isAction !== b._isAction) return a._isAction ? -1 : 1;
+    return (b.profit || 0) - (a.profit || 0);
   });
 
   let html = "";
-  for (const sym of symbols) {
-    const item = saved[sym];
-    const profitClass =
-      item.profit >= 0 ? "saved-profit-positive" : "saved-profit-negative";
-    const profitText =
-      (item.profit >= 0 ? "+" : "") + item.profit.toFixed(2);
+  for (const rec of records) {
+    const sym = rec.symbol;
+    const profit = rec.profit || 0;
+    const lastPrice = rec.last_price || 0;
 
-    const decision = item.last_decision || "HOLD";
-    const amount = item.last_amount || 0;
-    const actionPrice = item.last_action_price || 0.0;
+    const profitText =
+      (profit >= 0 ? "+$" : "-$") + Math.abs(profit).toFixed(2);
+    const profitClass =
+      profit >= 0 ? "saved-profit-positive" : "saved-profit-negative";
+
+    const dec = rec.last_decision || "HOLD";
+    const amt = rec.last_amount || 0;
 
     let decisionLabel = "HOLD";
-    if ((decision === "BUY" || decision === "SELL") && amount > 0) {
-      const priceStr =
-        actionPrice > 0 ? ` @ $${actionPrice.toFixed(2)}` : "";
-      decisionLabel = `${decision} ${amount}${priceStr}`;
+    let decisionColor = "#9ca3af";
+    if (dec === "BUY" && amt > 0) {
+      decisionLabel = `BUY ${amt}`;
+      decisionColor = "#4ade80";
+    } else if (dec === "SELL" && amt > 0) {
+      decisionLabel = `SELL ${amt}`;
+      decisionColor = "#f97373";
     }
-
-    const starOn = item.favorite === true;
 
     html += `
       <button type="button" class="saved-btn" data-symbol="${sym}">
-        <div class="saved-btn-main">
-          <div class="saved-left">
-            <span class="saved-symbol">${sym}</span>
-            <span class="saved-star ${starOn ? "saved-star-on" : ""}" data-symbol="${sym}" title="Toggle favorite">
-              ${starOn ? "★" : "☆"}
-            </span>
+        <div class="saved-grid"
+             style="display:grid;
+                    grid-template-columns: 1fr auto;
+                    grid-auto-rows:auto;
+                    row-gap:2px;">
+          <!-- row 1 -->
+          <div class="saved-symbol">${sym}</div>
+          <div class="saved-profit ${profitClass}" style="text-align:right;">
+            ${profitText}
           </div>
-          <div class="saved-right">
-            <span class="${profitClass}">${profitText}</span>
-            <span class="saved-delete" data-symbol="${sym}" title="Delete saved symbol">✕</span>
+          <!-- row 2 -->
+          <div class="saved-decision" style="color:${decisionColor};">
+            ${decisionLabel}
           </div>
-        </div>
-        <div class="saved-sub">
-          ${decisionLabel}
+          <div class="saved-last-price" style="text-align:right;">
+            $${lastPrice.toFixed(2)}
+          </div>
         </div>
       </button>
     `;
   }
+
   savedList.innerHTML = html;
 }
 
-function getIdent() {
-  const encoded = "QlQ4VVVBSklKMDlCMUlRRg==";
-  return atob(encoded);
+// ================== SYMBOL RESOLUTION ==================
+async function searchSymbolAlpha(query) {
+  const apiKey = getIdent();
+  const url = `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(
+    query
+  )}&apikey=${encodeURIComponent(apiKey)}`;
+
+  const data = await fetchJson(url);
+  if (!data || !Array.isArray(data.bestMatches)) {
+    return null;
+  }
+
+  const best = data.bestMatches[0];
+  if (!best) return null;
+
+  const symbol = best["1. symbol"];
+  const name = best["2. name"];
+  if (!symbol) return null;
+  return { symbol, name };
 }
 
-// Resolve freeform input (symbol or company name) to a stock symbol
+function normalizeNameKey(str) {
+  return str.trim().toLowerCase().replace(/[.,']/g, "");
+}
+
 async function resolveSymbol(inputStr) {
   const raw = inputStr.trim();
   if (!raw) throw new Error("Please enter a symbol or company name.");
 
   const upper = raw.toUpperCase();
   if (/^[A-Z.]{1,5}$/.test(upper) && !raw.includes(" ")) {
-    return { symbol: upper, source: "direct" };
+    return { symbol: upper, name: upper };
   }
 
-  const norm = normalizeName(raw);
-  const nameMap = loadNameMap();
-
-  if (nameMap[norm]) {
-    return { symbol: nameMap[norm], source: "cached-name" };
+  const key = normalizeNameKey(raw);
+  const map = loadNameMap();
+  if (map[key]) {
+    return { symbol: map[key], name: raw };
   }
 
-  if (BUILTIN_NAME_MAP[norm]) {
-    const sym = BUILTIN_NAME_MAP[norm];
-    saveNameMapEntry(norm, sym);
-    return { symbol: sym, source: "builtin-name" };
+  const builtin = BUILTIN_NAME_MAP[key];
+  if (builtin) {
+    const extra = loadNameMap();
+    extra[key] = builtin;
+    saveNameMap(extra);
+    return { symbol: builtin, name: raw };
   }
 
-  const url = `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(
-    raw
-  )}&apikey=${encodeURIComponent(getIdent())}`;
+  const res = await searchSymbolAlpha(raw);
+  if (!res) throw new Error("Could not resolve symbol for: " + raw);
 
-  const resp = await fetch(url);
-  const data = await resp.json();
+  const extra = loadNameMap();
+  extra[key] = res.symbol;
+  saveNameMap(extra);
 
-  if (!data || !data.bestMatches || !data.bestMatches.length) {
-    console.log("SYMBOL_SEARCH response:", data);
-    throw new Error("Could not find a matching stock symbol for that name.");
-  }
-
-  const best = data.bestMatches[0];
-  const sym = (best["1. symbol"] || "").toUpperCase();
-  if (!sym) {
-    throw new Error("Could not parse symbol from search result.");
-  }
-
-  saveNameMapEntry(norm, sym);
-  return { symbol: sym, source: "api-search" };
+  return res;
 }
 
-// Fetch stock data
+// ================== PRICE FETCHING ==================
 async function fetchStockDataFromApi(symbol) {
-  const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(
+  const apiKey = getIdent();
+  const baseUrl = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(
     symbol
-  )}&outputsize=compact&apikey=${encodeURIComponent(getIdent())}`;
+  )}&apikey=${encodeURIComponent(apiKey)}`;
 
-  const resp = await fetch(url);
-  const data = await resp.json();
+  // Try full history first
+  let url = baseUrl + "&outputsize=full";
+  let data = await fetchJson(url);
+
+  let info = (data && (data.Information || data.Note)) || "";
+  if (
+    !data["Time Series (Daily)"] &&
+    typeof info === "string" &&
+    info.toLowerCase().includes("outputsize=full")
+  ) {
+    // fall back to compact
+    console.warn("outputsize=full is premium; retrying with compact");
+    url = baseUrl + "&outputsize=compact";
+    data = await fetchJson(url);
+  }
 
   if (!data || !data["Time Series (Daily)"]) {
     console.log("AlphaVantage response:", data);
-    if (data && (data["Note"] || data["Information"])) {
-      throw new Error(data["Note"] || data["Information"]);
+    if (data && (data.Note || data.Information)) {
+      throw new Error(data.Note || data.Information);
     }
     if (data && data["Error Message"]) {
       throw new Error("API error: " + data["Error Message"]);
@@ -338,31 +361,27 @@ async function fetchStockDataFromApi(symbol) {
   }
 
   const series = data["Time Series (Daily)"];
-  const entries = Object.entries(series).map(([dateStr, daily]) => {
-    const price = parseFloat(daily["4. close"]);
-    return { dateStr, price };
-  });
+  const entries = Object.entries(series).map(([dateStr, daily]) => ({
+    dateStr,
+    price: parseFloat(daily["4. close"])
+  }));
 
+  // sort oldest → newest
   entries.sort((a, b) => (a.dateStr < b.dateStr ? -1 : 1));
 
-  const lastEntries = entries.slice(Math.max(0, entries.length - 260));
-  const dates = lastEntries.map((e) => e.dateStr);
-  const prices = lastEntries.map((e) => e.price);
+  const dates = entries.map((e) => e.dateStr);
+  const prices = entries.map((e) => e.price);
 
-  if (!prices.length) {
-    throw new Error("No prices returned for symbol " + symbol);
-  }
+  if (!prices.length) throw new Error("No prices for " + symbol);
 
   return { dates, prices };
 }
 
-// High-level: get stock data, using per-day cache
 async function getStockData(symbol) {
   const sym = symbol.toUpperCase();
-
   const cached = getCachedPricesIfFresh(sym);
   if (cached) {
-    setStatus(`Using cached prices for ${sym} (fetched earlier).`);
+    setStatus(`Using cached prices for ${sym} (fetched earlier today).`);
     return cached;
   }
 
@@ -372,6 +391,24 @@ async function getStockData(symbol) {
   return { dates, prices };
 }
 
+// Build equity curve for chosen thresholds by re-running strategy on prefixes
+function buildEquityCurve(prices, sellPctThresh, buyPctThresh) {
+  const curve = [];
+  for (let i = 0; i < prices.length; i++) {
+    const subPrices = prices.slice(0, i + 1);
+    const res = biasedTrader(
+      subPrices,
+      START_WALLET,
+      sellPctThresh,
+      buyPctThresh,
+      MAX_LOOKBACK_DAYS
+    );
+    curve.push(res.final_value);
+  }
+  return curve;
+}
+
+// ================== TRADING SIMULATION ==================
 function biasedTrader(
   prices,
   startWallet,
@@ -381,18 +418,17 @@ function biasedTrader(
   trackCurve = false
 ) {
   let wallet = startWallet;
-  let shares = []; // [buyPrice, amount]
+  let shares = []; // each lot: { buyPrice, amount }
   let lastDecision = "HOLD";
   let lastAmount = 0;
-  let lastActionPrice = 0.0;
+  let lastActionPrice = 0;
 
   const equityCurve = trackCurve ? [] : null;
 
-  // Initial point: total value at day 0
   if (trackCurve) {
-    const price0 = prices[0];
-    const totalShares0 = shares.reduce((acc, [, amt]) => acc + amt, 0);
-    const totalVal0 = wallet + totalShares0 * price0;
+    const p0 = prices[0];
+    const totalShares0 = shares.reduce((acc, lot) => acc + lot.amount, 0);
+    const totalVal0 = wallet + totalShares0 * p0;
     equityCurve.push(totalVal0);
   }
 
@@ -401,14 +437,16 @@ function biasedTrader(
 
     lastDecision = "HOLD";
     lastAmount = 0;
-    lastActionPrice = 0.0;
+    lastActionPrice = 0;
 
-    // SELL logic
+    // SELL lots with enough profit
     for (let idx = shares.length - 1; idx >= 0; idx--) {
-      const [buyPrice, amount] = shares[idx];
-      const profitPct =
-        buyPrice !== 0 ? ((price - buyPrice) / buyPrice) * 100 : 0;
+      const lot = shares[idx];
+      const buyPrice = lot.buyPrice;
+      const amount = lot.amount;
+      if (amount <= 0 || buyPrice <= 0) continue;
 
+      const profitPct = ((price - buyPrice) / buyPrice) * 100;
       if (buyPrice < price && profitPct > sellPctThresh) {
         wallet += amount * price;
         shares.splice(idx, 1);
@@ -418,14 +456,14 @@ function biasedTrader(
       }
     }
 
-    // BUY logic
+    // BUY based on biggest drop in last N days
     if (wallet > price) {
       let highestPercent = 0.0;
-      const maxBack = clampMinMax(maxLookbackDays + 1, 1, i);
+      const maxBack = clamp(maxLookbackDays + 1, 1, i);
 
       for (let x = 1; x < maxBack; x++) {
         const prevPrice = prices[i - x];
-        if (price < prevPrice) {
+        if (price < prevPrice && prevPrice > 0) {
           const dropPct = ((price - prevPrice) / prevPrice) * 100;
           if (dropPct < highestPercent) {
             highestPercent = dropPct;
@@ -435,15 +473,18 @@ function biasedTrader(
 
       if (highestPercent < -buyPctThresh) {
         let amount = 0;
-        for (let step = 1; step <= Math.floor(Math.abs(highestPercent)); step++) {
+        const maxSteps = Math.floor(Math.abs(highestPercent));
+        for (let step = 1; step <= maxSteps; step++) {
           if (wallet > price) {
             wallet -= price;
             amount += 1;
+          } else {
+            break;
           }
         }
 
         if (amount > 0) {
-          shares.push([price, amount]);
+          shares.push({ buyPrice: price, amount });
           lastAmount = amount;
           lastActionPrice = price;
           lastDecision = "BUY";
@@ -451,16 +492,15 @@ function biasedTrader(
       }
     }
 
-    // Track total value (wallet + shares*price)
     if (trackCurve) {
-      const totalShares = shares.reduce((acc, [, amt]) => acc + amt, 0);
+      const totalShares = shares.reduce((acc, lot) => acc + lot.amount, 0);
       const totalVal = wallet + totalShares * price;
       equityCurve.push(totalVal);
     }
   }
 
   const finalPrice = prices[prices.length - 1];
-  const totalShares = shares.reduce((acc, [, amt]) => acc + amt, 0);
+  const totalShares = shares.reduce((acc, lot) => acc + lot.amount, 0);
   const finalValue = wallet + totalShares * finalPrice;
   const profit = finalValue - startWallet;
 
@@ -475,65 +515,58 @@ function biasedTrader(
     last_amount: lastAmount,
     last_action_price: lastActionPrice,
     last_price: finalPrice,
-    equity_curve: equityCurve,
-    // 🔹 NEW: remember which lookback was used
-    lookback_days: maxLookbackDays
+    equity_curve: equityCurve
   };
 }
 
-
-async function gridSearchThresholdsWithProgress(prices, startWallet, onProgress) {
+async function gridSearchThresholdsWithProgress(
+  prices,
+  startWallet,
+  onProgress
+) {
   const sellValues = [];
   const buyValues = [];
   for (let i = 1; i <= 200; i++) {
-    const v = i / 10.0;
+    const v = i / 10.0; // 0.1 ... 20.0
     sellValues.push(v);
     buyValues.push(v);
   }
 
-  // 🔹 NEW: different lookback windows to try
-  const lookbackValues = [5, 10, 20, 30, 60];
-
-  const totalIters = sellValues.length * buyValues.length * lookbackValues.length;
+  const totalIters = sellValues.length * buyValues.length;
   let count = 0;
   let lastPercentShown = -1;
 
   let bestProfit = -Infinity;
   let bestResult = null;
 
-  for (let li = 0; li < lookbackValues.length; li++) {
-    const lookback = lookbackValues[li];
+  for (let si = 0; si < sellValues.length; si++) {
+    const sellThresh = sellValues[si];
+    for (let bi = 0; bi < buyValues.length; bi++) {
+      const buyThresh = buyValues[bi];
 
-    for (let si = 0; si < sellValues.length; si++) {
-      const sellThresh = sellValues[si];
+      count++;
+      const percent = Math.floor((count * 100) / totalIters);
+      if (onProgress && percent !== lastPercentShown) {
+        lastPercentShown = percent;
+        onProgress(percent);
+      }
 
-      for (let bi = 0; bi < buyValues.length; bi++) {
-        const buyThresh = buyValues[bi];
+      const res = biasedTrader(
+        prices,
+        startWallet,
+        sellThresh,
+        buyThresh,
+        MAX_LOOKBACK_DAYS,
+        false
+      );
 
-        count++;
-        const percent = Math.floor((count * 100) / totalIters);
-        if (onProgress && percent !== lastPercentShown) {
-          lastPercentShown = percent;
-          onProgress(percent);
-        }
+      if (res.profit > bestProfit) {
+        bestProfit = res.profit;
+        bestResult = res;
+      }
 
-        const res = biasedTrader(
-          prices,
-          startWallet,
-          sellThresh,
-          buyThresh,
-          lookback,
-          false
-        );
-
-        if (res.profit > bestProfit) {
-          bestProfit = res.profit;
-          bestResult = res; // res already carries lookback_days
-        }
-
-        if (count % 400 === 0) {
-          await new Promise((resolve) => requestAnimationFrame(resolve));
-        }
+      if (count % 400 === 0) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
       }
     }
   }
@@ -541,47 +574,39 @@ async function gridSearchThresholdsWithProgress(prices, startWallet, onProgress)
   if (onProgress) onProgress(100);
   return bestResult;
 }
+
+// ================== CHART RENDERING ==================
 function updateChart(symbol, dates, prices, equityCurve) {
   if (priceChart) {
     priceChart.destroy();
   }
 
-  const p0 = prices[0];
-
-  // Blue: actual stock price (already "normalized" to its own start)
-  const stockLine = prices.slice(); // just use raw prices
-
   const datasets = [
     {
       label: `${symbol.toUpperCase()} Price`,
-      data: stockLine,
-      borderWidth: 1.8,
+      data: prices,
+      borderWidth: 1.5,
       pointRadius: 0,
-      borderColor: "rgba(59,130,246,1)",        // blue line
-      backgroundColor: "rgba(59,130,246,0.12)", // soft blue fill
+      borderColor: "#3b82f6", // blue
+      backgroundColor: "rgba(59,130,246,0.15)",
+      tension: 0.15
     }
   ];
 
-  // equityCurve is total value = wallet + shares * price
   if (equityCurve && equityCurve.length === prices.length) {
-    const e0 = equityCurve[0];
-
-    const simNormalized = equityCurve.map(v => {
-      if (!isFinite(v) || !isFinite(e0) || e0 === 0 || !isFinite(p0) || p0 === 0) {
-        return p0;
-      }
-      // normalized to initial stock price:
-      // equity_t / equity_0 * p0
-      return (v / e0) * p0;
-    });
+    const firstPrice = prices[0];
+    const firstVal = equityCurve[0] || 1;
+    const factor = firstVal !== 0 ? firstPrice / firstVal : 1;
+    const normalizedSim = equityCurve.map((v) => v * factor);
 
     datasets.push({
       label: "Simulation value (normalized to initial stock price)",
-      data: simNormalized,
-      borderWidth: 1.8,
+      data: normalizedSim,
+      borderWidth: 1.5,
       pointRadius: 0,
-      borderColor: "rgba(34,197,94,1)",         // green line
-      backgroundColor: "rgba(34,197,94,0.12)",  // soft green fill
+      borderColor: "#22c55e", // green
+      backgroundColor: "rgba(34,197,94,0.15)",
+      tension: 0.15
     });
   }
 
@@ -594,29 +619,70 @@ function updateChart(symbol, dates, prices, equityCurve) {
     options: {
       responsive: true,
       maintainAspectRatio: false,
-      scales: {
-        x: {
-          ticks: {
-            maxTicksLimit: 8
-          }
-        },
-        y: {
-          beginAtZero: false
-        }
+      interaction: {
+        mode: "nearest",
+        intersect: false
       },
       plugins: {
         legend: {
           labels: { color: "#e5e7eb" }
+        },
+        zoom: {
+          pan: {
+            enabled: true,
+            mode: "x"
+          },
+          zoom: {
+            wheel: {
+              enabled: true
+            },
+            pinch: {
+              enabled: true
+            },
+            mode: "x"
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: {
+            maxTicksLimit: 8,
+            color: "#9ca3af"
+          }
+        },
+        y: {
+          beginAtZero: false,
+          ticks: { color: "#9ca3af" }
         }
       }
     }
   });
 }
 
+// Save the best simulation result for a symbol into localStorage
+function saveBestResult(symbol, result) {
+  const sym = symbol.toUpperCase();
+  const saved = loadSaved();
+  const prev = saved[sym] || {};
 
+  saved[sym] = {
+    symbol: sym,
+    sell_pct_thresh: result.sell_pct_thresh,
+    buy_pct_thresh: result.buy_pct_thresh,
+    profit: result.profit,
+    last_decision: result.last_decision,
+    last_amount: result.last_amount,
+    last_action_price: result.last_action_price,
+    last_price: result.last_price,
+    starred: prev.starred || false
+  };
 
+  saveSaved(saved);
+}
+
+// ================== MAIN RUN LOGIC ==================
 async function runForInput(inputValue, { forceReoptimize = false } = {}) {
-  const raw = inputValue.trim();
+  const raw = (inputValue || "").trim();
   if (!raw) return;
 
   runButton.disabled = true;
@@ -632,6 +698,7 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
   try {
     const { symbol, source } = await resolveSymbol(raw);
     input.value = symbol;
+
     let sourceLabel = "";
     if (source === "direct") sourceLabel = " (direct symbol)";
     else if (source === "builtin-name") sourceLabel = " (from built-in name)";
@@ -643,52 +710,40 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     const { dates, prices } = await getStockData(symbol);
 
-    const saved = loadSaved()[symbol.toUpperCase()];
+    const savedAll = loadSaved();
+    const saved = savedAll[symbol.toUpperCase()];
     let bestResult;
 
     if (saved && !forceReoptimize) {
       setProgress(20, "Using cached thresholds...");
-      const lookback = saved.lookback_days || MAX_LOOKBACK_DAYS;
       bestResult = biasedTrader(
         prices,
         START_WALLET,
         saved.sell_pct_thresh,
         saved.buy_pct_thresh,
-        lookback,
-        true
+        MAX_LOOKBACK_DAYS
       );
       bestResult.sell_pct_thresh = saved.sell_pct_thresh;
       bestResult.buy_pct_thresh = saved.buy_pct_thresh;
-      bestResult.lookback_days = lookback;
       setProgress(100, "Using cached thresholds");
     } else {
       setProgress(10, "Optimizing thresholds...");
-      const gridBest = await gridSearchThresholdsWithProgress(
+      bestResult = await gridSearchThresholdsWithProgress(
         prices,
         START_WALLET,
         (p) => setProgress(p, `Grid search: ${p}%`)
       );
-      if (!gridBest) throw new Error("No result from grid search.");
-
-      // Re-run once with curve tracking enabled for the best combo
-      // Re-run once with curve tracking enabled for the best combo
-      const bestLookback = gridBest.lookback_days || MAX_LOOKBACK_DAYS;
-      bestResult = biasedTrader(
-        prices,
-        START_WALLET,
-        gridBest.sell_pct_thresh,
-        gridBest.buy_pct_thresh,
-        bestLookback,
-        true
-      );
-      bestResult.lookback_days = bestLookback;
-
     }
 
-    if (!bestResult) throw new Error("No result from simulation.");
+    if (!bestResult) throw new Error("No result from grid search.");
 
-    // Update chart with both price and equity curve
-    updateChart(symbol, dates, prices, bestResult.equity_curve);
+    // Build equity curve for the best thresholds and update chart
+    const equityCurve = buildEquityCurve(
+      prices,
+      bestResult.sell_pct_thresh,
+      bestResult.buy_pct_thresh
+    );
+    updateChart(symbol, dates, prices, equityCurve);
 
     const decision = bestResult.last_decision;
     const amount = bestResult.last_amount;
@@ -702,28 +757,35 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     } else {
       decisionMain = "HOLD";
     }
+
     decisionText.textContent = `${symbol}: ${decisionMain}`;
     if (amount > 0 && actionPrice > 0) {
       decisionExtra.textContent = `Last action at $${actionPrice.toFixed(
         2
       )} | Last price $${bestResult.last_price.toFixed(2)}`;
     } else {
-      decisionExtra.textContent = `Last price $${bestResult.last_price.toFixed(2)}`;
+      decisionExtra.textContent = `$${bestResult.last_price.toFixed(2)}`;
     }
 
     thresholdsText.textContent = `Sell > ${bestResult.sell_pct_thresh.toFixed(
       1
     )}%, Buy drop > ${bestResult.buy_pct_thresh.toFixed(1)}%`;
-    const usedLookback = bestResult.lookback_days || MAX_LOOKBACK_DAYS;
-    thresholdsExtra.textContent = `Lookback up to ${usedLookback} days | Start wallet $${START_WALLET.toFixed(
+    thresholdsExtra.textContent = `Lookback up to ${MAX_LOOKBACK_DAYS} days | Start wallet $${START_WALLET.toFixed(
       2
     )}`;
 
-
     const profit = bestResult.profit;
     const finalValue = bestResult.final_value;
-    profitText.textContent =
-      (profit >= 0 ? "+" : "") + profit.toFixed(2) + " USD";
+    const profitPct = (profit / START_WALLET) * 100;
+
+    const profitStr =
+      (profit >= 0 ? "+$" : "-$") + Math.abs(profit).toFixed(2);
+    const pctStr =
+      (profitPct >= 0 ? "+" : "-") + Math.abs(profitPct).toFixed(2) + "%";
+
+    profitText.textContent = `${profitStr} (${pctStr})`;
+    profitText.style.color = profit >= 0 ? "#4ade80" : "#f97373";
+
     profitExtra.textContent = `Final value: $${finalValue.toFixed(
       2
     )} (wallet + holdings)`;
@@ -732,7 +794,7 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     setStatus(
       saved && !forceReoptimize
-        ? "Done (cached thresholds, refreshed prices if needed)."
+        ? "Done (cached thresholds, cached prices if available)."
         : "Done."
     );
   } catch (err) {
@@ -744,37 +806,19 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
   }
 }
 
+// ================== EVENT LISTENERS (MAIN) ==================
 form.addEventListener("submit", (e) => {
   e.preventDefault();
-  runForInput(input.value);
+  const val = input.value || "";
+  runForInput(val);
 });
 
-// Saved list clicks: run / star / delete
+runButton.addEventListener("click", () => {
+  const val = input.value || "";
+  runForInput(val);
+});
+
 savedList.addEventListener("click", (e) => {
-  const deleteEl = e.target.closest(".saved-delete");
-  if (deleteEl) {
-    e.stopPropagation();
-    const sym = deleteEl.dataset.symbol;
-    const saved = loadSaved();
-    delete saved[sym];
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
-    renderSavedList();
-    return;
-  }
-
-  const starEl = e.target.closest(".saved-star");
-  if (starEl) {
-    e.stopPropagation();
-    const sym = starEl.dataset.symbol;
-    const saved = loadSaved();
-    if (saved[sym]) {
-      saved[sym].favorite = !saved[sym].favorite;
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
-      renderSavedList();
-    }
-    return;
-  }
-
   const btn = e.target.closest(".saved-btn");
   if (!btn) return;
   const sym = btn.dataset.symbol;
@@ -787,5 +831,300 @@ clearSavedBtn.addEventListener("click", () => {
   renderSavedList();
 });
 
+// ================== SANDBOX: PORTFOLIO PLAYGROUND ==================
+
+// DOM
+const pfStartCashInput = document.getElementById("pf-start-cash");
+const pfStartDateInput = document.getElementById("pf-start-date");
+const pfRowsContainer = document.getElementById("pf-rows");
+const pfAddRowBtn = document.getElementById("pf-add-row");
+const pfRunPortfolioBtn = document.getElementById("pf-run-portfolio");
+const pfProgressBar = document.getElementById("pf-progress-bar");
+const pfProgressText = document.getElementById("pf-progress-text");
+const pfChartCanvas = document.getElementById("pf-chart-portfolio");
+
+let pfChart = null;
+
+function pfSetProgress(pct, text) {
+  if (!pfProgressBar || !pfProgressText) return;
+  const clamped = Math.max(0, Math.min(100, pct));
+  pfProgressBar.style.width = clamped + "%";
+  pfProgressText.textContent = text || "";
+}
+
+// create one row
+function pfCreateRow(initialSymbol = "", initialPrice = "", initialAmount = "") {
+  if (!pfRowsContainer) return;
+
+  const row = document.createElement("div");
+  row.className = "pf-row";
+  row.innerHTML = `
+    <input type="text"   class="pf-symbol" placeholder="e.g. NVDA or Apple" />
+    <input type="number" class="pf-price"  placeholder="optional" />
+    <input type="number" class="pf-amount" placeholder="0" value="0" />
+    <button type="button" class="pf-row-remove">✕</button>
+  `;
+
+  const symInput = row.querySelector(".pf-symbol");
+  const priceInput = row.querySelector(".pf-price");
+  const amountInput = row.querySelector(".pf-amount");
+  const removeBtn = row.querySelector(".pf-row-remove");
+
+  if (initialSymbol) symInput.value = initialSymbol;
+  if (initialPrice !== "") priceInput.value = initialPrice;
+  if (initialAmount !== "") amountInput.value = initialAmount;
+
+  removeBtn.addEventListener("click", () => {
+    row.remove();
+  });
+
+  pfRowsContainer.appendChild(row);
+}
+
+// read rows
+function pfCollectRows() {
+  const rows = [];
+  if (!pfRowsContainer) return rows;
+
+  const rowEls = pfRowsContainer.querySelectorAll(".pf-row");
+  rowEls.forEach((row) => {
+    const sym = row.querySelector(".pf-symbol")?.value.trim();
+    if (!sym) return;
+    const priceStr = row.querySelector(".pf-price")?.value.trim();
+    const amountStr = row.querySelector(".pf-amount")?.value.trim();
+    const price = priceStr === "" ? null : Number(priceStr);
+    const amount = amountStr === "" ? 0 : Number(amountStr);
+    if (isNaN(amount) || amount < 0) return;
+
+    rows.push({
+      rawSymbol: sym,
+      initialPrice: price,
+      amount
+    });
+  });
+
+  return rows;
+}
+
+// manual curve: hold given amounts for each stock + start cash
+function pfBuildManualCurve(dates, priceBySymbol, inputs, startCash) {
+  const curve = [];
+  for (const date of dates) {
+    let value = startCash;
+    for (const inp of inputs) {
+      const sym = inp.resolvedSymbol;
+      const map = priceBySymbol[sym];
+      const price = map ? map[date] : null;
+      if (price != null) {
+        value += inp.amount * price;
+      }
+    }
+    curve.push(value);
+  }
+  return curve;
+}
+
+// "Optimized" curve: pick best-performing single stock at each date (idealized)
+function pfBuildOptimizedCurve(dates, priceBySymbol, inputs, startCash) {
+  const perSymbolCurves = {};
+  for (const inp of inputs) {
+    const sym = inp.resolvedSymbol;
+    const map = priceBySymbol[sym];
+    const firstPrice = map[dates[0]];
+    if (!firstPrice) continue;
+    const curve = [];
+    for (const d of dates) {
+      const p = map[d];
+      if (!p) {
+        curve.push(startCash);
+      } else {
+        curve.push((startCash * p) / firstPrice);
+      }
+    }
+    perSymbolCurves[sym] = curve;
+  }
+
+  const optimized = [];
+  for (let i = 0; i < dates.length; i++) {
+    let best = startCash;
+    for (const sym of Object.keys(perSymbolCurves)) {
+      const c = perSymbolCurves[sym];
+      if (c[i] != null && c[i] > best) best = c[i];
+    }
+    optimized.push(best);
+  }
+  return optimized;
+}
+
+function pfUpdateChart(dates, manualCurve, optimizedCurve) {
+  if (!pfChartCanvas) return;
+
+  if (pfChart) pfChart.destroy();
+
+  const datasets = [];
+  if (manualCurve && manualCurve.length === dates.length) {
+    datasets.push({
+      label: "Manual portfolio total value",
+      data: manualCurve,
+      borderWidth: 1.5,
+      pointRadius: 0,
+      borderColor: "#3b82f6",
+      backgroundColor: "rgba(59,130,246,0.2)",
+      tension: 0.15
+    });
+  }
+  if (optimizedCurve && optimizedCurve.length === dates.length) {
+    datasets.push({
+      label: "Optimized portfolio total value",
+      data: optimizedCurve,
+      borderWidth: 1.5,
+      pointRadius: 0,
+      borderColor: "#22c55e",
+      backgroundColor: "rgba(34,197,94,0.2)",
+      tension: 0.15
+    });
+  }
+
+  pfChart = new Chart(pfChartCanvas.getContext("2d"), {
+    type: "line",
+    data: {
+      labels: dates,
+      datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: "nearest", intersect: false },
+      plugins: {
+        legend: { labels: { color: "#e5e7eb" } },
+        tooltip: { mode: "nearest", intersect: false }
+      },
+      scales: {
+        x: {
+          ticks: { color: "#9ca3af", maxTicksLimit: 8 },
+          grid: { color: "rgba(148,163,184,0.2)" }
+        },
+        y: {
+          ticks: { color: "#9ca3af" },
+          grid: { color: "rgba(148,163,184,0.2)" }
+        }
+      }
+    }
+  });
+}
+
+async function pfRunPortfolioAll() {
+  if (!pfStartCashInput || !pfRowsContainer) return;
+
+  pfSetProgress(5, "Collecting inputs...");
+
+  const startCash = Number(pfStartCashInput.value) || 0;
+  const startDateVal = pfStartDateInput?.value || "";
+  const rows = pfCollectRows();
+
+  if (!rows.length) {
+    pfSetProgress(0, "Please add at least one stock.");
+    return;
+  }
+
+  const resolvedInputs = [];
+  const priceBySymbol = {};
+  const dateSets = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    pfSetProgress(10 + (i * 20) / rows.length, `Resolving ${r.rawSymbol}...`);
+
+    let resolved;
+    try {
+      resolved = await resolveSymbol(r.rawSymbol);
+    } catch (e) {
+      console.error(e);
+      continue;
+    }
+    const symbol = resolved.symbol.toUpperCase();
+
+    let data;
+    try {
+      data = await getStockData(symbol);
+    } catch (e) {
+      console.error(e);
+      continue;
+    }
+
+    const dates = [];
+    const prices = [];
+    for (let idx = 0; idx < data.dates.length; idx++) {
+      const d = data.dates[idx];
+      if (startDateVal && d < startDateVal) continue;
+      dates.push(d);
+      prices.push(data.prices[idx]);
+    }
+    if (dates.length < 2) continue;
+
+    const map = {};
+    for (let idx = 0; idx < dates.length; idx++) {
+      map[dates[idx]] = prices[idx];
+    }
+
+    r.resolvedSymbol = symbol;
+    resolvedInputs.push(r);
+    priceBySymbol[symbol] = map;
+    dateSets.push(new Set(dates));
+  }
+
+  if (!resolvedInputs.length) {
+    pfSetProgress(0, "No valid symbols after resolution.");
+    return;
+  }
+
+  // intersection of dates
+  let commonDates = Array.from(dateSets[0]);
+  for (let i = 1; i < dateSets.length; i++) {
+    commonDates = commonDates.filter((d) => dateSets[i].has(d));
+  }
+  commonDates.sort();
+  if (commonDates.length < 2) {
+    pfSetProgress(0, "Not enough overlapping dates for all symbols.");
+    return;
+  }
+
+  pfSetProgress(60, "Building manual portfolio curve...");
+  const manualCurve = pfBuildManualCurve(
+    commonDates,
+    priceBySymbol,
+    resolvedInputs,
+    startCash
+  );
+
+  pfSetProgress(80, "Building optimized curve...");
+  const optimizedCurve = pfBuildOptimizedCurve(
+    commonDates,
+    priceBySymbol,
+    resolvedInputs,
+    startCash
+  );
+
+  pfUpdateChart(commonDates, manualCurve, optimizedCurve);
+  pfSetProgress(100, "Portfolio simulations complete.");
+}
+
+// wire sandbox buttons
+if (pfAddRowBtn && pfRowsContainer) {
+  pfAddRowBtn.addEventListener("click", () => {
+    pfCreateRow();
+  });
+  if (!pfRowsContainer.children.length) {
+    pfCreateRow();
+  }
+}
+
+if (pfRunPortfolioBtn) {
+  pfRunPortfolioBtn.addEventListener("click", () => {
+    pfRunPortfolioAll();
+  });
+}
+
+// ================== INIT ==================
 renderSavedList();
 input.focus();
