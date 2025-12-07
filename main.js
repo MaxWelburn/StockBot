@@ -458,69 +458,97 @@ async function getStockData(symbol) {
   return { dates, prices };
 }
 
-// ================== TRADING SIMULATION ==================
-// Core trading simulation with confidence + hysteresis
 function biasedTrader(
   prices,
   startWallet,
   sellPctThresh,
   buyPctThresh,
   maxLookbackDays,
-  riskMultiplier,
-  minHoldDays,
-  confidenceStrength,
-  hysteresisPct,
-  cooldownDaysAfterSell,
-  trackCurve = false
+  trackOrOptions = false
 ) {
-  let wallet = startWallet;
-  // each lot: { buyPrice, amount, buyIndex }
-  let shares = [];
+  if (!prices || prices.length === 0) {
+    return {
+      final_wallet: startWallet,
+      final_shares: [],
+      final_value: startWallet,
+      profit: 0,
+      sell_pct_thresh: sellPctThresh,
+      buy_pct_thresh: buyPctThresh,
+      last_decision: "HOLD",
+      last_amount: 0,
+      last_action_price: 0,
+      last_price: 0,
+      equity_curve: null,
+      buy_markers: null,
+      sell_markers: null,
+      shares_held: null,
+      wallet_series: null,
+      position_scale: 1.0,
+      min_hold_days: 0,
+      long_term_ratio: 0.0,
+      long_term_min_hold_days: 0
+    };
+  }
 
-  // Per-day output
+  let options = {};
+  let trackCurve = false;
+
+  if (typeof trackOrOptions === "boolean" || trackOrOptions == null) {
+    trackCurve = !!trackOrOptions;
+    options = {};
+  } else {
+    options = trackOrOptions || {};
+    trackCurve = !!options.trackCurve;
+  }
+
+  const positionScale = clamp(
+    typeof options.positionScale === "number" ? options.positionScale : 1.0,
+    0.25,
+    4.0
+  );
+  const minHoldDays = Math.max(
+    0,
+    Math.floor(
+      typeof options.minHoldDays === "number" ? options.minHoldDays : 0
+    )
+  );
+  const longTermRatio = clamp(
+    typeof options.longTermRatio === "number" ? options.longTermRatio : 0.0,
+    0.0,
+    0.9
+  );
+  const longTermMinHoldDays = Math.max(
+    0,
+    Math.floor(
+      typeof options.longTermMinHoldDays === "number"
+        ? options.longTermMinHoldDays
+        : 0
+    )
+  );
+
+  let wallet = startWallet;
+
+  // each lot: { buyPrice, amount, buyIndex, isLong }
+  let lots = [];
+
   let lastDecision = "HOLD";
   let lastAmount = 0;
-  let lastActionPrice = 0;
-
-  // For confidence / trend and hysteresis
-  const rm =
-    typeof riskMultiplier === "number" && isFinite(riskMultiplier) && riskMultiplier > 0
-      ? riskMultiplier
-      : 1.0;
-  const mh =
-    typeof minHoldDays === "number" && isFinite(minHoldDays) && minHoldDays > 0
-      ? Math.floor(minHoldDays)
-      : 0;
-  const conf =
-    typeof confidenceStrength === "number" && isFinite(confidenceStrength) && confidenceStrength >= 0
-      ? confidenceStrength
-      : 0.0;
-  const hyst =
-    typeof hysteresisPct === "number" && isFinite(hysteresisPct) && hysteresisPct >= 0
-      ? hysteresisPct
-      : 0.0;
-  const cooldown =
-    typeof cooldownDaysAfterSell === "number" &&
-    isFinite(cooldownDaysAfterSell) &&
-    cooldownDaysAfterSell > 0
-      ? Math.floor(cooldownDaysAfterSell)
-      : 0;
-
-  // For hysteresis: remember last sell
-  let lastSellPrice = null;
-  let lastSellIndex = Number.NEGATIVE_INFINITY;
+  let lastActionPrice = prices[0];
 
   const equityCurve = trackCurve ? [] : null;
-  const buyMarkers = trackCurve ? [] : null;
-  const sellMarkers = trackCurve ? [] : null;
+  const buyMarkers = trackCurve ? new Array(prices.length).fill(0) : null;
+  const sellMarkers = trackCurve ? new Array(prices.length).fill(0) : null;
+  const sharesHeld = trackCurve ? new Array(prices.length).fill(0) : null;
+  const walletSeries = trackCurve ? new Array(prices.length).fill(0) : null;
 
-  if (trackCurve && prices.length > 0) {
+  // day 0 snapshot
+  if (trackCurve) {
     const p0 = prices[0];
-    const totalShares0 = shares.reduce((acc, lot) => acc + lot.amount, 0);
+    const totalShares0 = lots.reduce((acc, lot) => acc + lot.amount, 0);
     const totalVal0 = wallet + totalShares0 * p0;
     equityCurve.push(totalVal0);
-    buyMarkers.push(0);
-    sellMarkers.push(0);
+    sharesHeld[0] = totalShares0;
+    walletSeries[0] = wallet;
   }
 
   for (let i = 1; i < prices.length; i++) {
@@ -530,86 +558,39 @@ function biasedTrader(
     lastAmount = 0;
     lastActionPrice = 0;
 
-    let dayBuy = 0;
-    let daySell = 0;
+    // ========== SELL PHASE ==========
+    if (lots.length) {
+      const hasShortLots = lots.some((lot) => !lot.isLong);
 
-    // --- CONFIDENCE: overbought/oversold vs recent moving average ---
-    let effectiveSellThresh = sellPctThresh;
-    let effectiveBuyThresh = buyPctThresh;
+      for (let idx = lots.length - 1; idx >= 0; idx--) {
+        const lot = lots[idx];
+        const buyPrice = lot.buyPrice;
+        const amount = lot.amount;
+        if (amount <= 0 || buyPrice <= 0) {
+          lots.splice(idx, 1);
+          continue;
+        }
 
-    if (conf > 0 && maxLookbackDays > 0 && i > 0) {
-      const win = Math.min(maxLookbackDays, i + 1); // include today
-      let sum = 0;
-      for (let j = i - win + 1; j <= i; j++) {
-        sum += prices[j];
-      }
-      const ma = sum / win;
-      if (ma > 0) {
-        const overboughtPct = ((price - ma) / ma) * 100; // >0 = above average
-        const ob = Math.max(0, overboughtPct);
+        const requiredHold = lot.isLong ? longTermMinHoldDays : minHoldDays;
+        const heldDays = i - lot.buyIndex;
+        if (requiredHold > 0 && heldDays < requiredHold) continue;
 
-        // When strongly above average:
-        //  - make SELL easier
-        //  - make BUY harder
-        const adj = ob * conf;
-        effectiveSellThresh = Math.max(0, sellPctThresh - adj);
-        effectiveBuyThresh = buyPctThresh + adj;
-      }
-    }
+        // long-term lots only sell if there are NO short-term lots
+        if (lot.isLong && hasShortLots) continue;
 
-    // --- SELL: take profits with min-hold and confidence-adjusted threshold ---
-    for (let idx = shares.length - 1; idx >= 0; idx--) {
-      const lot = shares[idx];
-      const buyPrice = lot.buyPrice;
-      const amount = lot.amount;
-      if (amount <= 0 || buyPrice <= 0) continue;
-
-      // respect minimum hold time for this lot
-      if (mh > 0) {
-        const buyIndex = typeof lot.buyIndex === "number" ? lot.buyIndex : i;
-        const heldDays = i - buyIndex;
-        if (heldDays < mh) continue;
-      }
-
-      const profitPct = ((price - buyPrice) / buyPrice) * 100;
-      if (buyPrice < price && profitPct > effectiveSellThresh) {
-        // sell entire lot
-        wallet += amount * price;
-        shares.splice(idx, 1);
-        daySell += amount;
-        lastAmount += amount;
-        lastActionPrice = price;
-        lastDecision = "SELL";
-      }
-    }
-
-    if (daySell > 0) {
-      lastSellIndex = i;
-      lastSellPrice = price;
-    }
-
-    // --- BUY: only if allowed by hysteresis & confidence ---
-    let allowedToBuy = true;
-
-    if ((hyst > 0 || cooldown > 0) && isFinite(lastSellIndex)) {
-      const daysSinceSell = i - lastSellIndex;
-
-      // Cooldown: wait N days after last SELL before any BUY
-      if (daysSinceSell < cooldown) {
-        allowedToBuy = false;
-      }
-
-      // Hysteresis: only buy back if clearly cheaper than the last sell
-      if (allowedToBuy && lastSellPrice != null && lastSellPrice > 0) {
-        const targetPrice = lastSellPrice * (1 - hyst / 100);
-        if (price > targetPrice) {
-          allowedToBuy = false;
+        const profitPct = ((price - buyPrice) / buyPrice) * 100;
+        if (buyPrice < price && profitPct > sellPctThresh) {
+          wallet += amount * price;
+          lots.splice(idx, 1);
+          lastAmount += amount;
+          lastActionPrice = price;
+          lastDecision = "SELL";
         }
       }
     }
 
-    if (wallet > price && allowedToBuy) {
-      // largest drop within lookback window
+    // ========== BUY PHASE ==========
+    if (wallet > price) {
       let highestPercent = 0.0;
       const maxBack = clamp(maxLookbackDays + 1, 1, i);
 
@@ -623,11 +604,10 @@ function biasedTrader(
         }
       }
 
-      // apply confidence-adjusted BUY threshold
-      if (highestPercent < -effectiveBuyThresh) {
+      if (highestPercent < -buyPctThresh) {
         let amount = 0;
-        const scaledDrop = Math.abs(highestPercent) * rm;
-        const maxSteps = Math.max(1, Math.floor(scaledDrop));
+        const maxSteps = Math.floor(Math.abs(highestPercent) * positionScale);
+
         for (let step = 1; step <= maxSteps; step++) {
           if (wallet > price) {
             wallet -= price;
@@ -638,8 +618,27 @@ function biasedTrader(
         }
 
         if (amount > 0) {
-          shares.push({ buyPrice: price, amount, buyIndex: i });
-          dayBuy += amount;
+          const longAmount =
+            longTermRatio > 0 ? Math.floor(amount * longTermRatio) : 0;
+          const shortAmount = amount - longAmount;
+
+          if (shortAmount > 0) {
+            lots.push({
+              buyPrice: price,
+              amount: shortAmount,
+              buyIndex: i,
+              isLong: false
+            });
+          }
+          if (longAmount > 0) {
+            lots.push({
+              buyPrice: price,
+              amount: longAmount,
+              buyIndex: i,
+              isLong: true
+            });
+          }
+
           lastAmount = amount;
           lastActionPrice = price;
           lastDecision = "BUY";
@@ -647,107 +646,83 @@ function biasedTrader(
       }
     }
 
+    // ========== TRACK CURVE & SERIES ==========
     if (trackCurve) {
-      const totalShares = shares.reduce((acc, lot) => acc + lot.amount, 0);
+      const totalShares = lots.reduce((acc, lot) => acc + lot.amount, 0);
       const totalVal = wallet + totalShares * price;
+
       equityCurve.push(totalVal);
-      buyMarkers.push(dayBuy);
-      sellMarkers.push(daySell);
+      sharesHeld[i] = totalShares;
+      walletSeries[i] = wallet;
+
+      if (lastDecision === "BUY" && lastAmount > 0) {
+        buyMarkers[i] = lastAmount;
+      } else if (lastDecision === "SELL" && lastAmount > 0) {
+        sellMarkers[i] = lastAmount;
+      }
     }
   }
 
   const finalPrice = prices[prices.length - 1];
-  const totalShares = shares.reduce((acc, lot) => acc + lot.amount, 0);
+  const totalShares = lots.reduce((acc, lot) => acc + lot.amount, 0);
   const finalValue = wallet + totalShares * finalPrice;
   const profit = finalValue - startWallet;
 
   return {
     final_wallet: wallet,
-    final_shares: shares,
+    final_shares: lots,
     final_value: finalValue,
     profit,
     sell_pct_thresh: sellPctThresh,
     buy_pct_thresh: buyPctThresh,
-    max_lookback_days: maxLookbackDays,
-    risk_multiplier: rm,
-    min_hold_days: mh,
-    confidence_strength: conf,
-    hysteresis_pct: hyst,
-    cooldown_days: cooldown,
     last_decision: lastDecision,
     last_amount: lastAmount,
     last_action_price: lastActionPrice,
     last_price: finalPrice,
-    equity_curve: trackCurve ? equityCurve : null,
-    buy_markers: trackCurve ? buyMarkers : null,
-    sell_markers: trackCurve ? sellMarkers : null
+    equity_curve: equityCurve,
+    buy_markers: buyMarkers,
+    sell_markers: sellMarkers,
+    shares_held: sharesHeld,
+    wallet_series: walletSeries,
+    position_scale: positionScale,
+    min_hold_days: minHoldDays,
+    long_term_ratio: longTermRatio,
+    long_term_min_hold_days: longTermMinHoldDays
   };
 }
-// Build equity data (curve + buy/sell markers + shares held + wallet series)
-function buildEquityData(
+
+// Build equity curve for chosen thresholds by re-running strategy on prefixes
+function buildEquityCurve(
   prices,
   sellPctThresh,
   buyPctThresh,
-  maxLookbackDays,
-  riskMultiplier,
+  positionScale,
   minHoldDays,
-  confidenceStrength,
-  hysteresisPct,
-  cooldownDays
+  longTermRatio,
+  longTermMinHoldDays
 ) {
-  const res = biasedTrader(
-    prices,
-    START_WALLET,
-    sellPctThresh,
-    buyPctThresh,
-    maxLookbackDays,
-    riskMultiplier,
-    minHoldDays,
-    confidenceStrength,
-    hysteresisPct,
-    cooldownDays,
-    true // trackCurve
-  );
-
-  const equityCurve = res.equity_curve || [];
-  const buyMarkers = res.buy_markers || [];
-  const sellMarkers = res.sell_markers || [];
-
-  // cumulative shares held = sum(buys) - sum(sells)
-  const sharesHeld = [];
-  let currentShares = 0;
-  for (let i = 0; i < buyMarkers.length; i++) {
-    const b = buyMarkers[i] || 0;
-    const s = sellMarkers[i] || 0;
-    currentShares += b - s;
-    sharesHeld.push(currentShares);
-  }
-
-  // wallet(t) = total_value(t) - shares(t) * price(t)
-  const walletSeries = [];
-  for (let i = 0; i < equityCurve.length; i++) {
-    const total = equityCurve[i];
-    const shares = sharesHeld[i] || 0;
-    const price = prices[i];
-    if (
-      typeof total === "number" &&
-      isFinite(total) &&
-      typeof price === "number" &&
-      isFinite(price)
-    ) {
-      walletSeries.push(total - shares * price);
-    } else {
-      walletSeries.push(NaN);
-    }
-  }
-
-  return {
-    equityCurve,
-    buyMarkers,
-    sellMarkers,
-    sharesHeld,
-    walletSeries
+  const curve = [];
+  const options = {
+    positionScale: positionScale ?? 1.0,
+    minHoldDays: minHoldDays ?? 0,
+    longTermRatio: longTermRatio ?? 0.0,
+    longTermMinHoldDays: longTermMinHoldDays ?? 0,
+    trackCurve: false
   };
+
+  for (let i = 0; i < prices.length; i++) {
+    const subPrices = prices.slice(0, i + 1);
+    const res = biasedTrader(
+      subPrices,
+      START_WALLET,
+      sellPctThresh,
+      buyPctThresh,
+      MAX_LOOKBACK_DAYS,
+      options
+    );
+    curve.push(res.final_value);
+  }
+  return curve;
 }
 
 async function gridSearchThresholdsWithProgress(
@@ -755,33 +730,28 @@ async function gridSearchThresholdsWithProgress(
   startWallet,
   onProgress
 ) {
-  // Thresholds (slightly narrowed range but still pretty fine-grained)
   const sellValues = [];
   const buyValues = [];
-  for (let v = 2.0; v <= 20.0001; v += 0.5) {
-    const rounded = Math.round(v * 10) / 10;
-    sellValues.push(rounded);
-    buyValues.push(rounded);
+
+  // 1.0% .. 25.0% in 0.5% steps
+  for (let i = 10; i <= 250; i += 5) {
+    const v = i / 10.0;
+    sellValues.push(v);
+    buyValues.push(v);
   }
 
-  const riskValues = [0.75, 1.0, 1.25];
-  const lookbackValues = [15, 30];
-  const minHoldValues = [0, 2];
-
-  // NEW: confidence + hysteresis grids
-  const confValues = [0.0, 0.3, 0.6, 0.9];   // how strongly overbought affects decisions
-  const hystValues = [0.0, 3.0, 6.0];        // % cheaper than last sell before rebuy
-  const cooldownValues = [0, 2];             // days after sell before allowed to buy
+  const positionScales = [0.5, 0.75, 1.0, 1.25];
+  const shortMinHolds = [0, 2, 5];
+  const longTermRatios = [0.0, 0.25, 0.5];
+  const longTermHoldDays = [0, 10, 20];
 
   const totalIters =
     sellValues.length *
     buyValues.length *
-    riskValues.length *
-    lookbackValues.length *
-    minHoldValues.length *
-    confValues.length *
-    hystValues.length *
-    cooldownValues.length;
+    positionScales.length *
+    shortMinHolds.length *
+    longTermRatios.length *
+    longTermHoldDays.length;
 
   let count = 0;
   let lastPercentShown = -1;
@@ -789,53 +759,50 @@ async function gridSearchThresholdsWithProgress(
   let bestProfit = -Infinity;
   let bestResult = null;
 
-  for (let si = 0; si < sellValues.length; si++) {
-    const sellThresh = sellValues[si];
-    for (let bi = 0; bi < buyValues.length; bi++) {
-      const buyThresh = buyValues[bi];
-      for (let ri = 0; ri < riskValues.length; ri++) {
-        const riskMult = riskValues[ri];
-        for (let li = 0; li < lookbackValues.length; li++) {
-          const lookback = lookbackValues[li];
-          for (let hi = 0; hi < minHoldValues.length; hi++) {
-            const minHold = minHoldValues[hi];
-            for (let ci = 0; ci < confValues.length; ci++) {
-              const conf = confValues[ci];
-              for (let yi = 0; yi < hystValues.length; yi++) {
-                const hyst = hystValues[yi];
-                for (let di = 0; di < cooldownValues.length; di++) {
-                  const cooldown = cooldownValues[di];
+  for (const sellThresh of sellValues) {
+    for (const buyThresh of buyValues) {
+      for (const posScale of positionScales) {
+        for (const minHold of shortMinHolds) {
+          for (const ltRatio of longTermRatios) {
+            for (const ltHold of longTermHoldDays) {
+              count++;
+              const percent = Math.floor((count * 100) / totalIters);
+              if (onProgress && percent !== lastPercentShown) {
+                lastPercentShown = percent;
+                onProgress(percent);
+              }
 
-                  count++;
-                  const percent = Math.floor((count * 100) / totalIters);
-                  if (onProgress && percent !== lastPercentShown) {
-                    lastPercentShown = percent;
-                    onProgress(percent);
-                  }
-
-                  const res = biasedTrader(
-                    prices,
-                    startWallet,
-                    sellThresh,
-                    buyThresh,
-                    lookback,
-                    riskMult,
-                    minHold,
-                    conf,
-                    hyst,
-                    cooldown,
-                    false
-                  );
-
-                  if (res.profit > bestProfit) {
-                    bestProfit = res.profit;
-                    bestResult = res;
-                  }
-
-                  if (count % 400 === 0) {
-                    await new Promise((resolve) => requestAnimationFrame(resolve));
-                  }
+              const res = biasedTrader(
+                prices,
+                startWallet,
+                sellThresh,
+                buyThresh,
+                MAX_LOOKBACK_DAYS,
+                {
+                  positionScale: posScale,
+                  minHoldDays: minHold,
+                  longTermRatio: ltRatio,
+                  longTermMinHoldDays: ltHold
                 }
+              );
+
+              if (res.profit > bestProfit) {
+                bestProfit = res.profit;
+                bestResult = {
+                  ...res,
+                  sell_pct_thresh: sellThresh,
+                  buy_pct_thresh: buyThresh,
+                  position_scale: posScale,
+                  min_hold_days: minHold,
+                  long_term_ratio: ltRatio,
+                  long_term_min_hold_days: ltHold
+                };
+              }
+
+              if (count % 400 === 0) {
+                await new Promise((resolve) =>
+                  requestAnimationFrame(resolve)
+                );
               }
             }
           }
@@ -1161,12 +1128,16 @@ function saveBestResult(symbol, result) {
     symbol: sym,
     sell_pct_thresh: result.sell_pct_thresh,
     buy_pct_thresh: result.buy_pct_thresh,
-    max_lookback_days: result.max_lookback_days,
-    risk_multiplier: result.risk_multiplier,
-    min_hold_days: result.min_hold_days,
-    confidence_strength: result.confidence_strength,
-    hysteresis_pct: result.hysteresis_pct,
-    cooldown_days: result.cooldown_days,
+    position_scale:
+      typeof result.position_scale === "number" ? result.position_scale : 1.0,
+    min_hold_days:
+      typeof result.min_hold_days === "number" ? result.min_hold_days : 0,
+    long_term_ratio:
+      typeof result.long_term_ratio === "number" ? result.long_term_ratio : 0.0,
+    long_term_min_hold_days:
+      typeof result.long_term_min_hold_days === "number"
+        ? result.long_term_min_hold_days
+        : 0,
     profit: result.profit,
     last_decision: result.last_decision,
     last_amount: result.last_amount,
@@ -1207,68 +1178,47 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     // load prices (from cache or API)
     const { dates, prices } = await getStockData(symbol);
 
-    const savedAll = loadSaved();
-    const saved = savedAll[symbol];
+        const savedAll = loadSaved();
+    const saved = savedAll[symbol.toUpperCase()];
     let bestResult;
 
-    // ---------- USE SAVED PARAMS (if any) ----------
     if (saved && !forceReoptimize) {
-      setProgress(20, "Using cached simulations…");
+      setProgress(20, "Using cached thresholds...");
 
-      const sell = saved.sell_pct_thresh;
-      const buy = saved.buy_pct_thresh;
-      const lookback = saved.max_lookback_days || MAX_LOOKBACK_DAYS;
-
-      const riskMult =
-        saved.risk_multiplier != null && isFinite(saved.risk_multiplier)
-          ? saved.risk_multiplier
-          : 1.0;
-      const minHold =
-        saved.min_hold_days != null && isFinite(saved.min_hold_days)
-          ? saved.min_hold_days
-          : 0;
-
-      const confStrength =
-        saved.confidence_strength != null && isFinite(saved.confidence_strength)
-          ? saved.confidence_strength
-          : 0.5;
-      const hysteresisPct =
-        saved.hysteresis_pct != null && isFinite(saved.hysteresis_pct)
-          ? saved.hysteresis_pct
-          : 4.0;
-      const cooldownDays =
-        saved.cooldown_days != null && isFinite(saved.cooldown_days)
-          ? Math.max(0, Math.floor(saved.cooldown_days))
-          : 2;
+      const options = {
+        positionScale:
+          typeof saved.position_scale === "number" ? saved.position_scale : 1.0,
+        minHoldDays:
+          typeof saved.min_hold_days === "number" ? saved.min_hold_days : 0,
+        longTermRatio:
+          typeof saved.long_term_ratio === "number"
+            ? saved.long_term_ratio
+            : 0.0,
+        longTermMinHoldDays:
+          typeof saved.long_term_min_hold_days === "number"
+            ? saved.long_term_min_hold_days
+            : 0
+      };
 
       bestResult = biasedTrader(
         prices,
         START_WALLET,
-        sell,
-        buy,
-        lookback,
-        riskMult,
-        minHold,
-        confStrength,
-        hysteresisPct,
-        cooldownDays,
-        false
+        saved.sell_pct_thresh,
+        saved.buy_pct_thresh,
+        MAX_LOOKBACK_DAYS,
+        options
       );
 
-      // carry params onto the result object so the rest of the UI can read them
-      bestResult.sell_pct_thresh = sell;
-      bestResult.buy_pct_thresh = buy;
-      bestResult.max_lookback_days = lookback;
-      bestResult.risk_multiplier = riskMult;
-      bestResult.min_hold_days = minHold;
-      bestResult.confidence_strength = confStrength;
-      bestResult.hysteresis_pct = hysteresisPct;
-      bestResult.cooldown_days = cooldownDays;
+      bestResult.sell_pct_thresh = saved.sell_pct_thresh;
+      bestResult.buy_pct_thresh = saved.buy_pct_thresh;
+      bestResult.position_scale = options.positionScale;
+      bestResult.min_hold_days = options.minHoldDays;
+      bestResult.long_term_ratio = options.longTermRatio;
+      bestResult.long_term_min_hold_days = options.longTermMinHoldDays;
 
       setProgress(100, "Using cached thresholds");
     } else {
-      // ---------- FULL GRID SEARCH ----------
-      setProgress(10, "Optimizing thresholds…");
+      setProgress(10, "Optimizing thresholds...");
       bestResult = await gridSearchThresholdsWithProgress(
         prices,
         START_WALLET,
@@ -1281,23 +1231,26 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     }
 
     // ---------- BUILD EQUITY CURVE & TRADE MARKERS FOR CHART ----------
-    const {
-      equityCurve,
-      buyMarkers,
-      sellMarkers,
-      sharesHeld,
-      walletSeries
-    } = buildEquityData(
+    const chartSim = biasedTrader(
       prices,
+      START_WALLET,
       bestResult.sell_pct_thresh,
       bestResult.buy_pct_thresh,
-      bestResult.max_lookback_days || MAX_LOOKBACK_DAYS,
-      bestResult.risk_multiplier != null ? bestResult.risk_multiplier : 1.0,
-      bestResult.min_hold_days != null ? bestResult.min_hold_days : 0,
-      bestResult.confidence_strength != null ? bestResult.confidence_strength : 0.0,
-      bestResult.hysteresis_pct != null ? bestResult.hysteresis_pct : 0.0,
-      bestResult.cooldown_days != null ? bestResult.cooldown_days : 0
+      MAX_LOOKBACK_DAYS,
+      {
+        positionScale: bestResult.position_scale ?? 1.0,
+        minHoldDays: bestResult.min_hold_days ?? 0,
+        longTermRatio: bestResult.long_term_ratio ?? 0.0,
+        longTermMinHoldDays: bestResult.long_term_min_hold_days ?? 0,
+        trackCurve: true
+      }
     );
+
+    const equityCurve = chartSim.equity_curve || [];
+    const buyMarkers = chartSim.buy_markers || [];
+    const sellMarkers = chartSim.sell_markers || [];
+    const sharesHeld = chartSim.shares_held || [];
+    const walletSeries = chartSim.wallet_series || [];
 
     updateChart(
       symbol,
@@ -1326,9 +1279,9 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
     decisionText.textContent = `${symbol}: ${decisionMain}`;
     if (amount > 0 && actionPrice > 0) {
-      decisionExtra.textContent = `Last action at $${actionPrice.toFixed(
+      decisionExtra.textContent = `$${actionPrice.toFixed(
         2
-      )} | Last price $${bestResult.last_price.toFixed(2)}`;
+      )}`;
     } else {
       decisionExtra.textContent = `$${bestResult.last_price.toFixed(2)}`;
     }
@@ -1338,28 +1291,19 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
       1
     )}%, Buy drop > ${bestResult.buy_pct_thresh.toFixed(1)}%`;
 
-    const confDisplay =
-      bestResult.confidence_strength != null
-        ? bestResult.confidence_strength.toFixed(2)
-        : "0.00";
-    const hystDisplay =
-      bestResult.hysteresis_pct != null
-        ? bestResult.hysteresis_pct.toFixed(1)
-        : "0.0";
-    const cooldownDisplay =
-      bestResult.cooldown_days != null ? bestResult.cooldown_days : 0;
+    const posScale = bestResult.position_scale ?? 1.0;
+    const minHold = bestResult.min_hold_days ?? 0;
+    const ltRatio = bestResult.long_term_ratio ?? 0.0;
+    const ltHold = bestResult.long_term_min_hold_days ?? 0;
 
     thresholdsExtra.textContent =
-      `Lookback: ${bestResult.max_lookback_days || MAX_LOOKBACK_DAYS}d · ` +
-      `Risk x${
-        (bestResult.risk_multiplier != null
-          ? bestResult.risk_multiplier
-          : 1
-        ).toFixed(2)
-      } · ` +
-      `Min hold: ${bestResult.min_hold_days != null ? bestResult.min_hold_days : 0}d · ` +
-      `Conf: ${confDisplay} · Hyst: ${hystDisplay}% · Cooldown: ${cooldownDisplay}d | ` +
-      `Start wallet $${START_WALLET.toFixed(2)}`;
+      `Lookback up to ${MAX_LOOKBACK_DAYS} days` +
+      ` | Pos scale ×${posScale.toFixed(2)}` +
+      ` | Short min hold ${minHold}d` +
+      ` | LT ratio ${(ltRatio * 100).toFixed(0)}%` +
+      ` | LT min hold ${ltHold}d` +
+      ` | Start wallet $${START_WALLET.toFixed(2)}`;
+
 
     // ---------- PROFIT TEXT ----------
     const profit = bestResult.profit;
