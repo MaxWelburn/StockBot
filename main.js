@@ -1,9 +1,9 @@
 // ================== CONSTANTS ==================
 const START_WALLET = 4000.0;
 const MAX_LOOKBACK_DAYS = 30;
-const STORAGE_KEY = "biasTraderSavedV1";
-const PRICE_CACHE_KEY = "biasTraderPriceV1";
-const NAME_MAP_KEY = "biasTraderNameMapV1";
+const STORAGE_KEY = "biasTraderSavedV7";
+const PRICE_CACHE_KEY = "biasTraderPriceV7";
+const NAME_MAP_KEY = "biasTraderNameMapV7";
 
 // Simple name→symbol hints
 const BUILTIN_NAME_MAP = {
@@ -33,6 +33,7 @@ const runButton = document.getElementById("run-button");
 const statusEl = document.getElementById("status");
 const progressBar = document.getElementById("progress-bar");
 const progressText = document.getElementById("progress-text");
+const etaText = document.getElementById("eta-text");
 
 const savedList = document.getElementById("saved-list");
 const clearSavedBtn = document.getElementById("clear-saved");
@@ -46,10 +47,18 @@ const profitExtra = document.getElementById("profit-extra");
 
 const chartCanvas = document.getElementById("chart");
 let priceChart = null;
-// Custom tooltip positioner:
-//  - base position from Chart's built-in "average" positioner
-//  - y attached to Simulation value point
-//  - side chosen by data index (left half / right half)
+
+// Track which symbol is currently shown on the main chart
+let currentSymbol = null;
+
+// Progress ETA state
+let lastProgressPercent = 0;
+let lastProgressTime = null;
+let etaTimerId = null;
+let etaRemainingSec = null;
+let currentProgressPercent = 0;
+let etaTargetPercent = 15; // optimistic: assume ~15 "iterations"
+
 if (typeof Chart !== "undefined" && Chart.Tooltip && Chart.Tooltip.positioners) {
   Chart.Tooltip.positioners.dynamicSide = function (items, eventPosition) {
     const chart = this.chart;
@@ -117,6 +126,90 @@ function setProgress(percent, label) {
   const p = Math.max(0, Math.min(100, percent));
   progressBar.style.width = p + "%";
   progressText.textContent = label || `Progress: ${p}%`;
+  currentProgressPercent = p;
+
+  const now =
+    typeof performance !== "undefined" && performance.now
+      ? performance.now()
+      : Date.now();
+
+  if (p > 0 && p < 100) {
+    // Optimistic ETA:
+    // - Start by assuming we'll finish around 15% progress.
+    // - If we pass that, bump the target up by +5% (20, 25, 30, ...).
+    if (p > etaTargetPercent && etaTargetPercent < 100) {
+      while (p > etaTargetPercent && etaTargetPercent < 100) {
+        etaTargetPercent += 5;
+      }
+    }
+
+    if (lastProgressTime != null && p > lastProgressPercent) {
+      const deltaP = p - lastProgressPercent;
+      const deltaT = now - lastProgressTime;
+
+      if (deltaP > 0 && deltaT > 0) {
+        const msPerPercent = deltaT / deltaP;
+
+        const remainingPercent = Math.max(etaTargetPercent - p, 0);
+        const remainingMs = msPerPercent * (remainingPercent || 1);
+
+        etaRemainingSec = Math.max(0, Math.round(remainingMs / 1000));
+      }
+    }
+
+    lastProgressTime = now;
+    lastProgressPercent = p;
+
+    if (etaText) {
+      if (
+        etaRemainingSec != null &&
+        isFinite(etaRemainingSec) &&
+        etaRemainingSec > 0
+      ) {
+        etaText.textContent = `Estimated remaining time: ${etaRemainingSec}s`;
+      } else {
+        etaText.textContent = "";
+      }
+    }
+
+    // Start a countdown timer if not already running
+    if (!etaTimerId && etaText) {
+      etaTimerId = setInterval(() => {
+        if (currentProgressPercent >= 100 || etaRemainingSec == null) {
+          clearInterval(etaTimerId);
+          etaTimerId = null;
+          if (etaText) etaText.textContent = "";
+          return;
+        }
+
+        if (etaRemainingSec > 0) {
+          etaRemainingSec -= 1;
+        }
+
+        if (etaText) {
+          if (etaRemainingSec > 0) {
+            etaText.textContent = `Estimated remaining time: ${etaRemainingSec}s`;
+          } else {
+            etaText.textContent = "Estimated remaining time: 0s";
+          }
+        }
+      }, 1000);
+    }
+  } else {
+    // When idle or finished, reset ETA
+    lastProgressTime = now;
+    lastProgressPercent = p;
+    etaRemainingSec = null;
+    etaTargetPercent = 15; // back to optimistic default
+
+    if (etaText) {
+      etaText.textContent = "";
+    }
+    if (etaTimerId) {
+      clearInterval(etaTimerId);
+      etaTimerId = null;
+    }
+  }
 }
 
 function todayISO() {
@@ -251,7 +344,6 @@ function saveSaved(obj) {
   }
 }
 
-// 2×2 grid saved list: symbol / profit on first row, decision / last price on second row
 function renderSavedList() {
   const saved = loadSaved();
   const symbols = Object.keys(saved);
@@ -262,19 +354,41 @@ function renderSavedList() {
     return;
   }
 
-  const records = symbols.map((sym) => saved[sym]);
+  // Build records with computed profit % upfront
+  const records = symbols.map((sym) => {
+    const rec = saved[sym];
+    const profit = rec.profit || 0;
 
-  // Mark BUY/SELL with amount vs HOLD
+    const startWallet =
+      typeof rec.start_wallet === "number" && isFinite(rec.start_wallet)
+        ? rec.start_wallet
+        : START_WALLET;
+
+    const profitPct =
+      startWallet > 0 && isFinite(startWallet)
+        ? (profit / startWallet) * 100
+        : 0;
+
+    return {
+      ...rec,
+      symbol: sym,
+      _profitPct: profitPct
+    };
+  });
+
+  // Mark which ones are BUY/SELL (with amount) vs HOLD
   records.forEach((rec) => {
     const dec = rec.last_decision || "HOLD";
     const amt = rec.last_amount || 0;
     rec._isAction = (dec === "BUY" || dec === "SELL") && amt > 0;
   });
 
-  // BUY/SELL first, then HOLD, within each: highest profit first
+  // Sort:
+  //  1) BUY/SELL group first, then HOLD group
+  //  2) Within each group, DESC by profit %
   records.sort((a, b) => {
     if (a._isAction !== b._isAction) return a._isAction ? -1 : 1;
-    return (b.profit || 0) - (a.profit || 0);
+    return (b._profitPct || 0) - (a._profitPct || 0);
   });
 
   let html = "";
@@ -283,8 +397,10 @@ function renderSavedList() {
     const profit = rec.profit || 0;
     const lastPrice = rec.last_price || 0;
 
-    const profitText =
-      (profit >= 0 ? "+$" : "-$") + Math.abs(profit).toFixed(2);
+    const profitPct = rec._profitPct || 0;
+    const profitPctText =
+      (profitPct >= 0 ? "+" : "-") + Math.abs(profitPct).toFixed(2) + "%";
+
     const profitClass =
       profit >= 0 ? "saved-profit-positive" : "saved-profit-negative";
 
@@ -308,23 +424,25 @@ function renderSavedList() {
                     grid-template-columns: 1fr auto;
                     grid-auto-rows:auto;
                     row-gap:2px;">
-        <!-- row 1 -->
+          <!-- row 1 -->
           <div class="saved-symbol">${sym}</div>
           <div class="saved-profit-cell"
                style="display:flex; justify-content:flex-end; align-items:center;">
-            <span class="saved-profit ${profitClass}" style="margin-right:4px;">
-              ${profitText}
+            <!-- TOP RIGHT: price -->
+            <span class="saved-last-price" style="margin-right:4px;">
+              $${lastPrice.toFixed(2)}
             </span>
             <span class="saved-delete" data-symbol="${sym}" title="Remove ${sym}">✕</span>
           </div>
-        <!-- row 2 -->
+          <!-- row 2 -->
           <div class="saved-decision" style="color:${decisionColor};">
             ${decisionLabel}
           </div>
           <div class="saved-last-price-cell"
                style="display:flex; justify-content:flex-end; align-items:center;">
-            <span class="saved-last-price" style="margin-right:14px;">
-              $${lastPrice.toFixed(2)}
+            <!-- BOTTOM RIGHT: % change -->
+            <span class="saved-profit ${profitClass}" style="margin-right:14px;">
+              ${profitPctText}
             </span>
           </div>
         </div>
@@ -333,6 +451,25 @@ function renderSavedList() {
   }
 
   savedList.innerHTML = html;
+  if (currentSymbol) {
+    markCurrentSymbol(currentSymbol);
+  }
+}
+
+function markCurrentSymbol(symbol) {
+  if (!symbol) return;
+  currentSymbol = symbol.toUpperCase();
+
+  if (!savedList) return;
+  const btns = savedList.querySelectorAll(".saved-btn");
+  btns.forEach((btn) => {
+    const isActive = btn.dataset.symbol === currentSymbol;
+    if (isActive) {
+      btn.classList.add("saved-btn-active");
+    } else {
+      btn.classList.remove("saved-btn-active");
+    }
+  });
 }
 
 // ================== SYMBOL RESOLUTION ==================
@@ -468,6 +605,7 @@ function biasedTrader(
 ) {
   if (!prices || prices.length === 0) {
     return {
+      start_wallet: startWallet,         // ← add this
       final_wallet: startWallet,
       final_shares: [],
       final_value: startWallet,
@@ -669,6 +807,7 @@ function biasedTrader(
   const profit = finalValue - startWallet;
 
   return {
+    start_wallet: startWallet,
     final_wallet: wallet,
     final_shares: lots,
     final_value: finalValue,
@@ -727,7 +866,7 @@ function buildEquityCurve(
 
 async function gridSearchThresholdsWithProgress(
   prices,
-  startWallet,
+  startWallet, // kept for compatibility, not used
   onProgress
 ) {
   const sellValues = [];
@@ -745,7 +884,14 @@ async function gridSearchThresholdsWithProgress(
   const longTermRatios = [0.0, 0.25, 0.5];
   const longTermHoldDays = [0, 10, 20];
 
+  // NEW: range of starting wallets to test
+  const walletValues = [];
+  for (let w = 100; w <= 10000; w += 100) {
+    walletValues.push(w);
+  }
+
   const totalIters =
+    walletValues.length *
     sellValues.length *
     buyValues.length *
     positionScales.length *
@@ -756,53 +902,70 @@ async function gridSearchThresholdsWithProgress(
   let count = 0;
   let lastPercentShown = -1;
 
-  let bestProfit = -Infinity;
+  let bestProfitPct = -Infinity;
+  let lastbestProfitPct = bestProfitPct;
+  let loopCounter = 0;
   let bestResult = null;
-
-  for (const sellThresh of sellValues) {
-    for (const buyThresh of buyValues) {
-      for (const posScale of positionScales) {
-        for (const minHold of shortMinHolds) {
-          for (const ltRatio of longTermRatios) {
-            for (const ltHold of longTermHoldDays) {
-              count++;
-              const percent = Math.floor((count * 100) / totalIters);
-              if (onProgress && percent !== lastPercentShown) {
-                lastPercentShown = percent;
-                onProgress(percent);
-              }
-
-              const res = biasedTrader(
-                prices,
-                startWallet,
-                sellThresh,
-                buyThresh,
-                MAX_LOOKBACK_DAYS,
-                {
-                  positionScale: posScale,
-                  minHoldDays: minHold,
-                  longTermRatio: ltRatio,
-                  longTermMinHoldDays: ltHold
+  for (const wallet of walletValues) {
+    loopCounter += 1;
+    if (loopCounter > 10) break;
+    if (bestProfitPct != lastbestProfitPct) {
+      lastbestProfitPct = bestProfitPct;
+      loopCounter = 0;
+    }
+    console.log(bestProfitPct);
+    for (const sellThresh of sellValues) {
+      for (const buyThresh of buyValues) {
+        for (const posScale of positionScales) {
+          for (const minHold of shortMinHolds) {
+            for (const ltRatio of longTermRatios) {
+              for (const ltHold of longTermHoldDays) {
+                count++;
+                const percent = Math.floor((count * 100) / totalIters);
+                if (onProgress && percent !== lastPercentShown) {
+                  lastPercentShown = percent;
+                  onProgress(percent);
                 }
-              );
 
-              if (res.profit > bestProfit) {
-                bestProfit = res.profit;
-                bestResult = {
-                  ...res,
-                  sell_pct_thresh: sellThresh,
-                  buy_pct_thresh: buyThresh,
-                  position_scale: posScale,
-                  min_hold_days: minHold,
-                  long_term_ratio: ltRatio,
-                  long_term_min_hold_days: ltHold
-                };
-              }
-
-              if (count % 400 === 0) {
-                await new Promise((resolve) =>
-                  requestAnimationFrame(resolve)
+                const res = biasedTrader(
+                  prices,
+                  wallet,
+                  sellThresh,
+                  buyThresh,
+                  MAX_LOOKBACK_DAYS,
+                  {
+                    positionScale: posScale,
+                    minHoldDays: minHold,
+                    longTermRatio: ltRatio,
+                    longTermMinHoldDays: ltHold
+                  }
                 );
+
+                const profit = res.profit;
+                const profitPct =
+                  wallet > 0 && isFinite(wallet)
+                    ? (profit / wallet) * 100
+                    : -Infinity;
+
+                if (profitPct > bestProfitPct) {
+                  bestProfitPct = profitPct;
+                  bestResult = {
+                    ...res,
+                    sell_pct_thresh: sellThresh,
+                    buy_pct_thresh: buyThresh,
+                    position_scale: posScale,
+                    min_hold_days: minHold,
+                    long_term_ratio: ltRatio,
+                    long_term_min_hold_days: ltHold,
+                    start_wallet: wallet
+                  };
+                }
+
+                if (count % 400 === 0) {
+                  await new Promise((resolve) =>
+                    requestAnimationFrame(resolve)
+                  );
+                }
               }
             }
           }
@@ -810,8 +973,8 @@ async function gridSearchThresholdsWithProgress(
       }
     }
   }
+  onProgress(100);
 
-  if (onProgress) onProgress(100);
   return bestResult;
 }
 
@@ -823,7 +986,8 @@ function updateChart(
   buyMarkers = [],
   sellMarkers = [],
   sharesHeld = [],
-  walletSeries = []
+  walletSeries = [],
+  startWalletUsed = START_WALLET
 ) {
   if (priceChart) {
     priceChart.destroy();
@@ -846,10 +1010,10 @@ function updateChart(
   if (equityCurve && equityCurve.length === prices.length) {
     normalizedSim = equityCurve.map((totalVal, idx) => {
       const price = prices[idx];
-      if (!isFinite(totalVal) || !isFinite(price) || START_WALLET === 0) {
+      if (!isFinite(totalVal) || !isFinite(price) || startWalletUsed === 0) {
         return null;
       }
-      return (totalVal / START_WALLET) * price;
+      return (totalVal / startWalletUsed) * price;
     });
 
     datasets.push({
@@ -1126,6 +1290,10 @@ function saveBestResult(symbol, result) {
 
   saved[sym] = {
     symbol: sym,
+    start_wallet:
+      typeof result.start_wallet === "number" && isFinite(result.start_wallet)
+        ? result.start_wallet
+        : START_WALLET,
     sell_pct_thresh: result.sell_pct_thresh,
     buy_pct_thresh: result.buy_pct_thresh,
     position_scale:
@@ -1154,6 +1322,8 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
   const raw = (inputValue || "").trim();
   if (!raw) return;
 
+  let symbolUsed = null; // track which symbol we actually resolved
+
   runButton.disabled = true;
   setStatus("Resolving symbol...");
   setProgress(0, "Resolving symbol...");
@@ -1170,6 +1340,7 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     // resolve symbol (name → symbol, or use raw if it already looks like a ticker)
     const resolved = await resolveSymbol(raw);
     const symbol = resolved.symbol.toUpperCase();
+    symbolUsed = symbol;
     input.value = symbol;
 
     setStatus(`Using symbol ${symbol}…`);
@@ -1178,12 +1349,17 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     // load prices (from cache or API)
     const { dates, prices } = await getStockData(symbol);
 
-        const savedAll = loadSaved();
+    const savedAll = loadSaved();
     const saved = savedAll[symbol.toUpperCase()];
     let bestResult;
 
     if (saved && !forceReoptimize) {
-      setProgress(20, "Using cached thresholds...");
+      setProgress(20, "Using cached thresholds");
+
+      const usedStartWalletFromSaved =
+        typeof saved.start_wallet === "number" && isFinite(saved.start_wallet)
+          ? saved.start_wallet
+          : START_WALLET;
 
       const options = {
         positionScale:
@@ -1202,13 +1378,15 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
       bestResult = biasedTrader(
         prices,
-        START_WALLET,
+        usedStartWalletFromSaved,
         saved.sell_pct_thresh,
         saved.buy_pct_thresh,
         MAX_LOOKBACK_DAYS,
         options
       );
 
+      // make sure the result object carries over the tuned parameters
+      bestResult.start_wallet = usedStartWalletFromSaved;
       bestResult.sell_pct_thresh = saved.sell_pct_thresh;
       bestResult.buy_pct_thresh = saved.buy_pct_thresh;
       bestResult.position_scale = options.positionScale;
@@ -1218,22 +1396,26 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
 
       setProgress(100, "Using cached thresholds");
     } else {
-      setProgress(10, "Optimizing thresholds...");
+      setProgress(10, "Optimizing thresholds.");
       bestResult = await gridSearchThresholdsWithProgress(
         prices,
         START_WALLET,
         (p) => setProgress(p, `Grid search: ${p}%`)
       );
     }
-
     if (!bestResult) {
       throw new Error("No result from grid search.");
     }
 
     // ---------- BUILD EQUITY CURVE & TRADE MARKERS FOR CHART ----------
+    const usedStartWallet =
+      typeof bestResult.start_wallet === "number" && isFinite(bestResult.start_wallet)
+        ? bestResult.start_wallet
+        : START_WALLET;
+
     const chartSim = biasedTrader(
       prices,
-      START_WALLET,
+      usedStartWallet,
       bestResult.sell_pct_thresh,
       bestResult.buy_pct_thresh,
       MAX_LOOKBACK_DAYS,
@@ -1260,7 +1442,8 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
       buyMarkers,
       sellMarkers,
       sharesHeld,
-      walletSeries
+      walletSeries,
+      usedStartWallet
     );
 
     // ---------- DECISION TEXT ----------
@@ -1295,20 +1478,18 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     const minHold = bestResult.min_hold_days ?? 0;
     const ltRatio = bestResult.long_term_ratio ?? 0.0;
     const ltHold = bestResult.long_term_min_hold_days ?? 0;
-
     thresholdsExtra.textContent =
       `Lookback up to ${MAX_LOOKBACK_DAYS} days` +
       ` | Pos scale ×${posScale.toFixed(2)}` +
       ` | Short min hold ${minHold}d` +
       ` | LT ratio ${(ltRatio * 100).toFixed(0)}%` +
       ` | LT min hold ${ltHold}d` +
-      ` | Start wallet $${START_WALLET.toFixed(2)}`;
-
+      ` | Start wallet $${usedStartWallet.toFixed(2)}`;
 
     // ---------- PROFIT TEXT ----------
     const profit = bestResult.profit;
     const finalValue = bestResult.final_value;
-    const profitPct = (profit / START_WALLET) * 100;
+    const profitPct = (profit / usedStartWallet) * 100;
 
     const profitStr =
       (profit >= 0 ? "+$" : "-$") + Math.abs(profit).toFixed(2);
@@ -1329,14 +1510,19 @@ async function runForInput(inputValue, { forceReoptimize = false } = {}) {
     renderSavedList();
 
     setStatus("Done");
+    input.value = "";
   } catch (err) {
     console.error(err);
     setStatus(String(err), true);
     setProgress(0, "Idle");
   } finally {
     runButton.disabled = false;
+    if (symbolUsed) {
+      markCurrentSymbol(symbolUsed);
+    }
   }
 }
+
 
 // ================== EVENT LISTENERS (MAIN) ==================
 form.addEventListener("submit", (e) => {
@@ -1368,7 +1554,16 @@ savedList.addEventListener("click", (e) => {
   // Otherwise, clicking the row runs the simulation
   const btn = e.target.closest(".saved-btn");
   if (!btn) return;
+
   const sym = btn.dataset.symbol;
+  if (!sym) return;
+
+  // If this symbol is already selected, don't re-run / redraw
+  if (currentSymbol && sym.toUpperCase() === currentSymbol.toUpperCase()) {
+    // already showing this stock; do nothing
+    return;
+  }
+
   input.value = sym;
   runForInput(sym);
 });

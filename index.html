@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Stock Bias Trader + Sandbox</title>
+  <title>Stock Decision Bot</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- Charts -->
@@ -114,7 +114,13 @@
     .progress-text {
       font-size: 0.8rem;
       color: #8f96c7;
+      margin-bottom: 0.35rem;
+    }
+    .eta-text {
+      font-size: 0.75rem;
+      color: #a5acd9;
       margin-bottom: 0.75rem;
+      min-height: 1em;
     }
 
     /* Layout: sidebar + main panel */
@@ -382,9 +388,9 @@
 <body>
   <!-- Primary UI box -->
   <div class="container">
-    <h1>Stock Bias Trader</h1>
+    <h1>Stock Decision Bot</h1>
     <div class="subtitle">
-      Enter a symbol or company name &amp; it will find the best recommendation to earn the most profit.
+      Enter a symbol or company name &amp; it will find the best recommendation to earn the most profit
     </div>
 
     <form id="symbol-form">
@@ -399,6 +405,7 @@
       <div id="progress-bar" class="progress-bar"></div>
     </div>
     <div id="progress-text" class="progress-text">Idle</div>
+    <div id="eta-text" class="progress-text eta-text"></div>
 
     <div class="layout">
       <!-- Left: saved symbols -->
