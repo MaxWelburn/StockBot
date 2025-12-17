@@ -8,6 +8,9 @@ const MODE_PRECISE = "precise";
 // Quick mode runs a single simulation using this fixed starting wallet:
 const QUICK_START_WALLET = 4000.0;
 
+// Bulk reload: start the next symbol every N ms (staggered concurrency)
+const RELOAD_ALL_STAGGER_MS = 2000;
+
 
 // Regime / mean-reversion scaling (helps avoid buying tiny dips after huge run-ups,
 // and buys more aggressively after large multi-day dips)
@@ -162,6 +165,7 @@ const etaText = document.getElementById("eta-text");
 
 const savedList = document.getElementById("saved-list");
 const clearSavedBtn = document.getElementById("clear-saved");
+const reloadSavedBtn = document.getElementById("reload-saved");
 
 const decisionText = document.getElementById("decision-text");
 const decisionExtra = document.getElementById("decision-extra");
@@ -476,6 +480,74 @@ function formatMoney(value, withSign = false) {
   return sign + abs;
 }
 
+// Estimate average win/loss % from trade markers (buy/sell shares) on the chart simulation.
+// We treat remaining (unsold) lots as unrealized P/L at the latest price so losses can appear.
+function computeAvgWinLossFromMarkers(prices, buyMarkers = [], sellMarkers = []) {
+  if (!Array.isArray(prices) || prices.length < 2) return null;
+
+  const lots = []; // FIFO lots: { shares, price }
+  const wins = []; // { shares, pct }
+  const losses = []; // { shares, pct }
+
+  const toNum = (v) => (typeof v === "number" && isFinite(v) ? v : 0);
+
+  for (let i = 0; i < prices.length; i++) {
+    const price = toNum(prices[i]);
+    if (!price) continue;
+
+    const bought = toNum(buyMarkers && buyMarkers[i]);
+    if (bought > 0) {
+      lots.push({ shares: bought, price });
+    }
+
+    let sold = toNum(sellMarkers && sellMarkers[i]);
+    while (sold > 0 && lots.length) {
+      const lot = lots[0];
+      const take = Math.min(sold, lot.shares);
+      const pct = lot.price > 0 ? ((price - lot.price) / lot.price) * 100 : 0;
+
+      if (pct >= 0) wins.push({ shares: take, pct });
+      else losses.push({ shares: take, pct });
+
+      lot.shares -= take;
+      sold -= take;
+
+      if (lot.shares <= 1e-9) lots.shift();
+    }
+  }
+
+  // Include remaining lots as unrealized P/L at the latest price (so "loss" isn't always 0)
+  const lastPrice = toNum(prices[prices.length - 1]);
+  if (lastPrice > 0 && lots.length) {
+    for (const lot of lots) {
+      const pct = lot.price > 0 ? ((lastPrice - lot.price) / lot.price) * 100 : 0;
+      if (pct >= 0) wins.push({ shares: lot.shares, pct });
+      else losses.push({ shares: lot.shares, pct });
+    }
+  }
+
+  const sumShares = (arr) => arr.reduce((acc, x) => acc + toNum(x.shares), 0);
+  const wAvgPct = (arr) => {
+    const total = sumShares(arr);
+    if (total <= 0) return NaN;
+    const num = arr.reduce((acc, x) => acc + toNum(x.shares) * toNum(x.pct), 0);
+    return num / total;
+  };
+
+  const winShares = sumShares(wins);
+  const lossShares = sumShares(losses);
+
+  return {
+    avgWinPct: wAvgPct(wins),
+    avgLossPct: wAvgPct(losses),
+    winShares,
+    lossShares,
+    winSamples: wins.length,
+    lossSamples: losses.length
+  };
+}
+
+
 // ================== API KEY HANDLING ==================
 // BT8UUAJIJ09B1IQF encoded in base64
 function getIdent() {
@@ -631,7 +703,6 @@ function loadSaved() {
           // ignore save failures
         }
       }
-
       return parsed;
     }
   } catch (e) {
@@ -648,6 +719,225 @@ function saveSaved(obj) {
   }
 }
 
+
+// ================== RELOAD ALL SAVED (APPLY EXISTING CALCS TO LATEST PRICES) ==================
+// This does NOT re-optimize. It re-runs each stock using its cached thresholds/settings
+// (Precise preferred; otherwise Quick) and updates only the outputs (profit/decision/last price).
+// getStockData() already checks per-stock cache before making an API call.
+
+function pickPreferredSavedMode(rec) {
+  const modes = rec && rec.modes ? rec.modes : {};
+  if (modes[MODE_PRECISE]) return MODE_PRECISE;
+  if (modes[MODE_QUICK]) return MODE_QUICK;
+  return null;
+}
+
+function buildOptionsFromModeRec(modeRec) {
+  return {
+    positionScale: typeof modeRec.position_scale === "number" ? modeRec.position_scale : 1.0,
+    minHoldDays: typeof modeRec.min_hold_days === "number" ? modeRec.min_hold_days : 0,
+    longTermRatio: typeof modeRec.long_term_ratio === "number" ? modeRec.long_term_ratio : 0.0,
+    longTermMinHoldDays:
+      typeof modeRec.long_term_min_hold_days === "number" ? modeRec.long_term_min_hold_days : 0,
+
+    regimeSensitivity:
+      typeof modeRec.regime_sensitivity === "number" ? modeRec.regime_sensitivity : REGIME_SENS_DEFAULT,
+    regimeWindowDays:
+      typeof modeRec.regime_window_days === "number" ? modeRec.regime_window_days : REGIME_WINDOW_DAYS,
+    regimeTrendDays:
+      typeof modeRec.regime_trend_days === "number" ? modeRec.regime_trend_days : REGIME_TREND_DAYS,
+    regimeRangePct:
+      typeof modeRec.regime_range_pct === "number" ? modeRec.regime_range_pct : REGIME_RANGE_PCT
+  };
+}
+
+function runUsingExistingCalcs(prices, modeKey, modeRec) {
+  const startWallet =
+    typeof modeRec.start_wallet === "number" && isFinite(modeRec.start_wallet)
+      ? modeRec.start_wallet
+      : (modeKey === MODE_QUICK ? QUICK_START_WALLET : START_WALLET);
+
+  const options = buildOptionsFromModeRec(modeRec);
+
+  const res = biasedTrader(
+    prices,
+    startWallet,
+    modeRec.sell_pct_thresh,
+    modeRec.buy_pct_thresh,
+    MAX_LOOKBACK_DAYS,
+    options
+  );
+
+  // carry forward tuned params for saving consistency
+  res.start_wallet = startWallet;
+  res.sell_pct_thresh = modeRec.sell_pct_thresh;
+  res.buy_pct_thresh = modeRec.buy_pct_thresh;
+  res.position_scale = options.positionScale;
+  res.min_hold_days = options.minHoldDays;
+  res.long_term_ratio = options.longTermRatio;
+  res.long_term_min_hold_days = options.longTermMinHoldDays;
+
+  res.regime_sensitivity = options.regimeSensitivity;
+  res.regime_window_days = options.regimeWindowDays;
+  res.regime_trend_days = options.regimeTrendDays;
+  res.regime_range_pct = options.regimeRangePct;
+
+  // Convert executed-trade output into the wallet-independent, sized signal for UI/saving.
+  const execDecision = res.last_decision;
+  const execAmount = res.last_amount;
+
+  const snap = {
+    wallet: res.final_wallet,
+    shares: Array.isArray(res.final_shares)
+      ? res.final_shares.reduce((acc, lot) => acc + (lot.amount || 0), 0)
+      : 0
+  };
+
+  const signal = computeSignalSizedDecision(prices, res, snap);
+
+  res.exec_last_decision = execDecision;
+  res.exec_last_amount = execAmount;
+  res.signal_score = signal.score;
+  res.signal_reason = signal.reason;
+  res.signal_suggested_shares = signal.suggestedShares;
+
+  res.last_decision = signal.decision;
+  res.last_amount = signal.size || "";
+  res.last_action_price = res.last_price;
+
+  return res;
+}
+
+function updateSavedRunOutputs(savedObj, sym, modeKey, newRes) {
+  const rec = savedObj[sym];
+  if (!rec || !rec.modes || !rec.modes[modeKey]) return;
+
+  const modeRec = rec.modes[modeKey];
+
+  // Update outputs only
+  modeRec.profit = newRes.profit;
+  modeRec.last_decision = newRes.last_decision;
+  modeRec.last_amount = newRes.last_amount;
+  modeRec.last_action_price = newRes.last_action_price;
+  modeRec.last_price = newRes.last_price;
+
+  // Extra debug/signal fields
+  modeRec.exec_last_decision = newRes.exec_last_decision || null;
+  modeRec.exec_last_amount = (typeof newRes.exec_last_amount === "number") ? newRes.exec_last_amount : null;
+  modeRec.signal_score = (typeof newRes.signal_score === "number") ? newRes.signal_score : null;
+  modeRec.signal_reason = newRes.signal_reason || null;
+  modeRec.signal_suggested_shares = (typeof newRes.signal_suggested_shares === "number") ? newRes.signal_suggested_shares : null;
+
+  rec.modes[modeKey] = modeRec;
+
+  // Refresh top-level compatibility fields (Precise preferred)
+  const displayMode = rec.modes[MODE_PRECISE] ? MODE_PRECISE : (rec.modes[MODE_QUICK] ? MODE_QUICK : modeKey);
+  const displayRec = rec.modes[displayMode] || modeRec;
+
+  rec.last_run_mode = displayMode;
+  rec.calc_used = displayRec.calc_used;
+  rec.updated_at = displayRec.updated_at || null;
+  rec.updated_date = displayRec.updated_date || null;
+
+  rec.start_wallet = displayRec.start_wallet;
+  rec.sell_pct_thresh = displayRec.sell_pct_thresh;
+  rec.buy_pct_thresh = displayRec.buy_pct_thresh;
+  rec.position_scale = displayRec.position_scale;
+  rec.min_hold_days = displayRec.min_hold_days;
+  rec.long_term_ratio = displayRec.long_term_ratio;
+  rec.long_term_min_hold_days = displayRec.long_term_min_hold_days;
+
+  rec.regime_sensitivity = displayRec.regime_sensitivity;
+  rec.regime_window_days = displayRec.regime_window_days;
+  rec.regime_trend_days = displayRec.regime_trend_days;
+  rec.regime_range_pct = displayRec.regime_range_pct;
+
+  rec.profit = displayRec.profit;
+  rec.last_decision = displayRec.last_decision;
+  rec.last_amount = displayRec.last_amount;
+  rec.last_action_price = displayRec.last_action_price;
+  rec.last_price = displayRec.last_price;
+
+  savedObj[sym] = rec;
+}
+
+async function reloadAllSavedSymbolsApplyOnly() {
+  const saved = loadSaved();
+  const symbols = Object.keys(saved || {}).filter((s) => s && typeof s === "string");
+  if (!symbols.length) {
+    setStatus("No saved symbols to reload.");
+    return;
+  }
+
+  reloadSavedBtn.disabled = true;
+  runButton.disabled = true;
+
+  let completed = 0;
+  const total = symbols.length;
+
+  try {
+    setStatus(`Reloading ${total} saved symbol(s)...`);
+    setProgress(0, `Reloading ${total} symbol(s)...`);
+
+    // Start each symbol after RELOAD_ALL_STAGGER_MS, without waiting for the prior one to finish.
+    const tasks = symbols.map((sym, idx) => {
+      return new Promise((resolve) => {
+        setTimeout(async () => {
+          const upper = String(sym).toUpperCase();
+          try {
+            const rec = saved[upper];
+            const modes = rec && rec.modes ? rec.modes : null;
+            if (!modes) throw new Error("Missing modes for saved symbol.");
+
+            // Prefer Precise if it exists; otherwise use Quick if it exists.
+            const modeKey = modes[MODE_PRECISE] ? MODE_PRECISE : (modes[MODE_QUICK] ? MODE_QUICK : null);
+            if (!modeKey) throw new Error("No cached mode found.");
+
+            const modeRec = modes[modeKey];
+            if (!modeRec || typeof modeRec.sell_pct_thresh !== "number" || typeof modeRec.buy_pct_thresh !== "number") {
+              throw new Error("Missing cached thresholds.");
+            }
+
+            // Fetch fresh prices (may hit cache)
+            const data = await getStockData(upper);
+            const prices = data && Array.isArray(data.prices) ? data.prices : [];
+            if (!prices.length) throw new Error("No price data.");
+
+            // Rerun using existing calcs (fast)
+            const newRes = runUsingExistingCalcs(prices, modeKey, modeRec);
+            newRes.calc_used = modeRec.calc_used || `Using cached ${modeKey} settings`;
+            newRes.updated_at = new Date().toISOString();
+            newRes.updated_date = new Date().toLocaleDateString();
+
+            updateSavedRunOutputs(saved, upper, modeKey, newRes);
+
+            // re-render list as each stock completes
+            renderSavedList();
+          } catch (e) {
+            console.warn(`[Reload all] ${upper} failed:`, e);
+          } finally {
+            completed++;
+            const pct = Math.round((completed * 100) / total);
+            setProgress(pct, `Reloaded ${completed}/${total}`);
+            resolve();
+          }
+        }, idx * RELOAD_ALL_STAGGER_MS);
+      });
+    });
+
+    await Promise.all(tasks);
+
+    saveSaved(saved);
+    renderSavedList();
+    setStatus("Reload complete.");
+    setProgress(100, "Reload complete.");
+  } finally {
+    reloadSavedBtn.disabled = false;
+    runButton.disabled = false;
+  }
+}
+
+
 function renderSavedList() {
   const saved = loadSaved();
   const symbols = Object.keys(saved);
@@ -658,14 +948,20 @@ function renderSavedList() {
     return;
   }
 
-  // Build records with computed profit % upfront
+  // Build records with computed profit % upfront (prefer Precise whenever present)
   const records = symbols.map((sym) => {
-    const rec = saved[sym];
-    const profit = rec.profit || 0;
+    const rec = saved[sym] || {};
+    const modes = (rec && typeof rec === "object" && rec.modes) ? rec.modes : {};
+
+    const displayMode =
+      modes[MODE_PRECISE] ? MODE_PRECISE : (modes[MODE_QUICK] ? MODE_QUICK : (rec.last_run_mode || MODE_QUICK));
+    const displayRec = (modes && modes[displayMode]) ? modes[displayMode] : rec;
+
+    const profit = (displayRec && typeof displayRec.profit === "number") ? displayRec.profit : 0;
 
     const startWallet =
-      typeof rec.start_wallet === "number" && isFinite(rec.start_wallet)
-        ? rec.start_wallet
+      displayRec && typeof displayRec.start_wallet === "number" && isFinite(displayRec.start_wallet)
+        ? displayRec.start_wallet
         : START_WALLET;
 
     const profitPct =
@@ -673,23 +969,23 @@ function renderSavedList() {
         ? (profit / startWallet) * 100
         : 0;
 
+    const dec = (displayRec && displayRec.last_decision) ? displayRec.last_decision : "HOLD";
+    const amtRaw = (displayRec && displayRec.last_amount != null) ? displayRec.last_amount : "";
+    const amtLabel = (typeof amtRaw === "string") ? amtRaw : ((typeof amtRaw === "number" && amtRaw > 0) ? String(amtRaw) : "");
+
+    const isAction = (dec === "BUY" || dec === "SELL") && !!amtLabel;
+
     return {
       ...rec,
       symbol: sym,
-      _profitPct: profitPct
+      _displayMode: displayMode,
+      _displayRec: displayRec,
+      _profitPct: profitPct,
+      _isAction: isAction
     };
   });
 
-  // Mark which ones are BUY/SELL (with amount) vs HOLD
-  records.forEach((rec) => {
-    const dec = rec.last_decision || "HOLD";
-    const amt = rec.last_amount || 0;
-    rec._isAction = (dec === "BUY" || dec === "SELL") && amt > 0;
-  });
-
-  // Sort:
-  //  1) BUY/SELL group first, then HOLD group
-  //  2) Within each group, DESC by profit %
+  // Sort: action first, then by profit%
   records.sort((a, b) => {
     if (a._isAction !== b._isAction) return a._isAction ? -1 : 1;
     return (b._profitPct || 0) - (a._profitPct || 0);
@@ -698,8 +994,21 @@ function renderSavedList() {
   let html = "";
   for (const rec of records) {
     const sym = rec.symbol;
-    const profit = rec.profit || 0;
-    const lastPrice = rec.last_price || 0;
+    const displayRec = rec._displayRec || rec;
+
+    const profit = (displayRec && typeof displayRec.profit === "number") ? displayRec.profit : 0;
+
+    // Prefer freshest price from the daily price cache (so list updates even if calcs are not re-saved)
+    let lastPrice = (displayRec && typeof displayRec.last_price === "number") ? displayRec.last_price : 0;
+    try {
+      const cached = getCachedPricesIfFresh(sym);
+      if (cached && Array.isArray(cached.prices) && cached.prices.length) {
+        const p = cached.prices[cached.prices.length - 1];
+        if (typeof p === "number" && isFinite(p)) lastPrice = p;
+      }
+    } catch (e) {
+      // ignore cache read issues
+    }
 
     const profitPct = rec._profitPct || 0;
     const profitPctText =
@@ -708,17 +1017,15 @@ function renderSavedList() {
     const profitClass =
       profit >= 0 ? "saved-profit-positive" : "saved-profit-negative";
 
-    const dec = rec.last_decision || "HOLD";
-    const amt = rec.last_amount || 0;
+    const dec = (displayRec && displayRec.last_decision) ? displayRec.last_decision : "HOLD";
+    const amtRaw = (displayRec && displayRec.last_amount != null) ? displayRec.last_amount : "";
+    const amtLabel = (typeof amtRaw === "string") ? amtRaw : ((typeof amtRaw === "number" && amtRaw > 0) ? String(amtRaw) : "");
 
     let decisionLabel = "HOLD";
     let decisionColor = "#9ca3af";
-    if (dec === "BUY" && amt > 0) {
-      decisionLabel = `BUY ${amt}`;
-      decisionColor = "#4ade80";
-    } else if (dec === "SELL" && amt > 0) {
-      decisionLabel = `SELL ${amt}`;
-      decisionColor = "#f97373";
+    if ((dec === "BUY" || dec === "SELL") && amtLabel) {
+      decisionLabel = `${dec} ${amtLabel}`;
+      decisionColor = dec === "BUY" ? "#4ade80" : "#f97373";
     }
 
     html += `
@@ -734,23 +1041,22 @@ function renderSavedList() {
                style="display:flex; justify-content:flex-end; align-items:center;">
             <!-- TOP RIGHT: price + reload -->
             <span class="saved-last-price">
-              $${lastPrice.toFixed(2)}
+              $${Number(lastPrice || 0).toFixed(2)}
             </span>
             <span class="saved-reload"
                   data-symbol="${sym}"
-                  title="Re-run simulation for ${sym}">⟳</span>
+                  title="Reload: single click = reuse cached calcs; double click = clear caches + rerun">⟳</span>
           </div>
 
           <!-- row 2 -->
-          <div class="saved-decision" style="color:${decisionColor};">
+          <div class="saved-decision"
+               style="color:${decisionColor}; font-weight:600;">
             ${decisionLabel}
           </div>
-          <div class="saved-last-price-cell"
-               style="display:flex; justify-content:flex-end; align-items:center;">
-            <!-- BOTTOM RIGHT: % change + delete -->
-            <span class="saved-profit ${profitClass}">
-              ${profitPctText}
-            </span>
+
+          <div class="saved-profit ${profitClass}"
+               style="text-align:right;">
+            ${profitPctText}
             <span class="saved-delete"
                   data-symbol="${sym}"
                   title="Remove ${sym}">✕</span>
@@ -1235,6 +1541,192 @@ function biasedTrader(
     regime_window_days: regimeWindowDays,
     regime_trend_days: regimeTrendDays,
     regime_range_pct: regimeRangePct
+  };
+}
+
+// ================== SIGNAL (WALLET-INDEPENDENT) DECISION + SIZING ==================
+// This decouples the "signal" (BUY/SELL/HOLD + Low/Med/High) from whether the backtest
+// actually had wallet available to execute that trade. This fixes the "wallet=0 => HOLD"
+// issue while still using the optimized thresholds/settings from the simulations.
+
+const SIZE_LOW = "LOW";
+const SIZE_MED = "MEDIUM";
+const SIZE_HIGH = "HIGH";
+
+function _sizeFromScore(score) {
+  if (!isFinite(score) || score <= 0) return null;
+  if (score < 0.60) return SIZE_LOW;
+  if (score < 1.40) return SIZE_MED;
+  return SIZE_HIGH;
+}
+
+function _sizeFraction(size) {
+  if (size === SIZE_LOW) return 0.15;
+  if (size === SIZE_MED) return 0.35;
+  if (size === SIZE_HIGH) return 0.65;
+  return 0.0;
+}
+
+function computeRegimeAtIndex(prices, i, baseParams) {
+  const price = prices[i];
+  const regimeSensitivity = clamp(
+    typeof baseParams.regime_sensitivity === "number" ? baseParams.regime_sensitivity : REGIME_SENS_DEFAULT,
+    0.0, 2.0
+  );
+  const regimeWindowDays = Math.max(
+    3,
+    Math.floor(typeof baseParams.regime_window_days === "number" ? baseParams.regime_window_days : REGIME_WINDOW_DAYS)
+  );
+  const regimeTrendDays = Math.max(
+    2,
+    Math.floor(typeof baseParams.regime_trend_days === "number" ? baseParams.regime_trend_days : REGIME_TREND_DAYS)
+  );
+  const regimeRangePct = Math.max(
+    5,
+    typeof baseParams.regime_range_pct === "number" ? baseParams.regime_range_pct : REGIME_RANGE_PCT
+  );
+
+  const sellPctThresh = typeof baseParams.sell_pct_thresh === "number" ? baseParams.sell_pct_thresh : 0;
+  const buyPctThresh = typeof baseParams.buy_pct_thresh === "number" ? baseParams.buy_pct_thresh : 0;
+
+  const wStart = Math.max(0, i - regimeWindowDays);
+  let wMin = Infinity;
+  let wMax = -Infinity;
+  for (let j = wStart; j <= i; j++) {
+    const v = prices[j];
+    if (v < wMin) wMin = v;
+    if (v > wMax) wMax = v;
+  }
+
+  const wRange = wMax - wMin;
+  const rangePct = wMin > 0 ? (wRange / wMin) * 100 : 0;
+  const posInRange = wRange > 0 ? (price - wMin) / wRange : 0.5;
+
+  const tIdx = Math.max(0, i - regimeTrendDays);
+  const tRef = prices[tIdx];
+  const trendPct = tRef > 0 ? ((price - tRef) / tRef) * 100 : 0;
+
+  const rangeStrength = clamp((rangePct - regimeRangePct) / regimeRangePct, 0, 2) / 2; // 0..1
+  const posHighStrength = clamp((posInRange - 0.75) / 0.25, 0, 1);
+  const posLowStrength = clamp((0.25 - posInRange) / 0.25, 0, 1);
+  const trendUpStrength = clamp((trendPct - regimeRangePct) / regimeRangePct, 0, 2) / 2;
+  const trendDownStrength = clamp(((-trendPct) - regimeRangePct) / regimeRangePct, 0, 2) / 2;
+
+  const overextendedStrength = rangeStrength * Math.max(posHighStrength, trendUpStrength);
+  const oversoldStrength = rangeStrength * Math.max(posLowStrength, trendDownStrength);
+
+  let effSellPctThresh = sellPctThresh;
+  let effBuyPctThresh = buyPctThresh;
+
+  if (overextendedStrength > 0) {
+    effBuyPctThresh = buyPctThresh * (1 + regimeSensitivity * 1.25 * overextendedStrength);
+    effSellPctThresh = Math.max(
+      0.5,
+      sellPctThresh * (1 - regimeSensitivity * 0.25 * overextendedStrength)
+    );
+  } else if (oversoldStrength > 0) {
+    effBuyPctThresh = Math.max(
+      0.5,
+      buyPctThresh * (1 - regimeSensitivity * 0.45 * oversoldStrength)
+    );
+  }
+
+  return {
+    effSellPctThresh,
+    effBuyPctThresh,
+    overextendedStrength,
+    oversoldStrength,
+    trendPct,
+    rangePct,
+    posInRange,
+    regimeRangePct
+  };
+}
+
+function computeSignalSizedDecision(prices, bestParams, portfolioSnap = null) {
+  if (!Array.isArray(prices) || prices.length < 3) {
+    return { decision: "HOLD", size: null, score: 0, reason: "Not enough data", suggestedShares: 0 };
+  }
+
+  const i = prices.length - 1;
+  const price = prices[i];
+
+  const regime = computeRegimeAtIndex(prices, i, bestParams);
+
+  // Look at a recent window for extremes (separate from regime window; this is "latest trend")
+  const signalWindow = Math.max(10, Math.min(45, Math.floor((bestParams.regime_window_days ?? REGIME_WINDOW_DAYS) * 1.5)));
+  const start = Math.max(0, i - signalWindow);
+
+  let recentHigh = -Infinity;
+  let recentLow = Infinity;
+  for (let j = start; j <= i; j++) {
+    const v = prices[j];
+    if (v > recentHigh) recentHigh = v;
+    if (v < recentLow) recentLow = v;
+  }
+
+  const dropFromHighPct = recentHigh > 0 ? ((recentHigh - price) / recentHigh) * 100 : 0;
+  const riseFromLowPct = recentLow > 0 ? ((price - recentLow) / recentLow) * 100 : 0;
+
+  let buyScore = 0;
+  let sellScore = 0;
+
+  if (dropFromHighPct > regime.effBuyPctThresh) {
+    buyScore = (dropFromHighPct - regime.effBuyPctThresh) / Math.max(0.5, regime.effBuyPctThresh);
+  }
+  if (riseFromLowPct > regime.effSellPctThresh) {
+    sellScore = (riseFromLowPct - regime.effSellPctThresh) / Math.max(0.5, regime.effSellPctThresh);
+  }
+
+  // Boost score based on regime context + trend direction
+  buyScore *= (1 + 0.80 * regime.oversoldStrength);
+  sellScore *= (1 + 0.80 * regime.overextendedStrength);
+
+  if (regime.trendPct < 0) {
+    buyScore *= (1 + clamp((-regime.trendPct) / Math.max(5, regime.regimeRangePct), 0, 1));
+  } else if (regime.trendPct > 0) {
+    sellScore *= (1 + clamp((regime.trendPct) / Math.max(5, regime.regimeRangePct), 0, 1));
+  }
+
+  const minScore = 0.12;
+  if (buyScore < minScore && sellScore < minScore) {
+    return {
+      decision: "HOLD",
+      size: null,
+      score: Math.max(buyScore, sellScore),
+      reason: "Within thresholds",
+      suggestedShares: 0,
+      effBuyPctThresh: regime.effBuyPctThresh,
+      effSellPctThresh: regime.effSellPctThresh
+    };
+  }
+
+  const decision = buyScore >= sellScore ? "BUY" : "SELL";
+  const score = Math.max(buyScore, sellScore);
+  const size = _sizeFromScore(score);
+
+  let suggestedShares = 0;
+  if (portfolioSnap && price > 0 && isFinite(price) && size) {
+    const frac = _sizeFraction(size);
+    if (decision === "BUY") {
+      const cash = typeof portfolioSnap.wallet === "number" ? portfolioSnap.wallet : 0;
+      suggestedShares = Math.floor((cash * frac) / price);
+    } else if (decision === "SELL") {
+      const sh = typeof portfolioSnap.shares === "number" ? portfolioSnap.shares : 0;
+      suggestedShares = Math.floor(sh * frac);
+    }
+  }
+
+  return {
+    decision,
+    size,
+    score,
+    reason: decision === "BUY"
+      ? `Drop from recent high ${dropFromHighPct.toFixed(1)}% vs buy ${regime.effBuyPctThresh.toFixed(1)}%`
+      : `Rise from recent low ${riseFromLowPct.toFixed(1)}% vs sell ${regime.effSellPctThresh.toFixed(1)}%`,
+    suggestedShares,
+    effBuyPctThresh: regime.effBuyPctThresh,
+    effSellPctThresh: regime.effSellPctThresh
   };
 }
 
@@ -1926,6 +2418,27 @@ function saveBestResult(symbol, result, { mode = MODE_PRECISE, calcUsed = "" } =
 
   if (!prev.modes) prev.modes = {};
 
+  const hasPreciseAlready = !!prev.modes[MODE_PRECISE];
+
+  // Per request:
+  // - Always save Precise (and store the date).
+  // - Only save Quick if there is NO Precise cache for this symbol.
+  // - Keep any existing Quick in localStorage (do not delete it), but don't overwrite it once Precise exists.
+  if (modeKey === MODE_QUICK && hasPreciseAlready) {
+    // Still ensure the symbol exists in saved (don’t lose starred state), but do not overwrite cached calcs.
+    saved[sym] = {
+      ...(saved[sym] || {}),
+      symbol: sym,
+      modes: prev.modes,
+      starred: prevStar,
+      // Prefer Precise as the default "display" mode when it exists
+      last_run_mode: MODE_PRECISE,
+      calc_used: (prev.modes[MODE_PRECISE] && prev.modes[MODE_PRECISE].calc_used) || prev.calc_used || "Precise"
+    };
+    saveSaved(saved);
+    return;
+  }
+
   const modeRecord = {
     symbol: sym,
     start_wallet:
@@ -1942,47 +2455,73 @@ function saveBestResult(symbol, result, { mode = MODE_PRECISE, calcUsed = "" } =
       typeof result.min_hold_days === "number" ? result.min_hold_days : 0,
     long_term_ratio:
       typeof result.long_term_ratio === "number" ? result.long_term_ratio : 0.0,
-    long_term_min_hold_days: result.long_term_min_hold_days,
-    regime_sensitivity: typeof result.regime_sensitivity === "number" ? result.regime_sensitivity : REGIME_SENS_DEFAULT,
-    regime_window_days: typeof result.regime_window_days === "number" ? result.regime_window_days : REGIME_WINDOW_DAYS,
-    regime_trend_days: typeof result.regime_trend_days === "number" ? result.regime_trend_days : REGIME_TREND_DAYS,
-    regime_range_pct: typeof result.regime_range_pct === "number" ? result.regime_range_pct : REGIME_RANGE_PCT,
+    long_term_min_hold_days:
+      typeof result.long_term_min_hold_days === "number"
+        ? result.long_term_min_hold_days
+        : 0,
+    regime_sensitivity:
+      typeof result.regime_sensitivity === "number" ? result.regime_sensitivity : REGIME_SENS_DEFAULT,
+    regime_window_days:
+      typeof result.regime_window_days === "number" ? result.regime_window_days : REGIME_WINDOW_DAYS,
+    regime_trend_days:
+      typeof result.regime_trend_days === "number" ? result.regime_trend_days : REGIME_TREND_DAYS,
+    regime_range_pct:
+      typeof result.regime_range_pct === "number" ? result.regime_range_pct : REGIME_RANGE_PCT,
     profit: result.profit,
     last_decision: result.last_decision,
     last_amount: result.last_amount,
     last_action_price: result.last_action_price,
     last_price: result.last_price,
+
+    // Debug/extra: keep last EXECUTED trade from the backtest (wallet-dependent)
+    exec_last_decision: result.exec_last_decision || null,
+    exec_last_amount: (typeof result.exec_last_amount === "number" ? result.exec_last_amount : null),
+
+    // Signal strength metadata (wallet-independent)
+    signal_score: (typeof result.signal_score === "number" && isFinite(result.signal_score)) ? result.signal_score : null,
+    signal_reason: result.signal_reason || null,
+    signal_suggested_shares: (typeof result.signal_suggested_shares === "number" ? result.signal_suggested_shares : null),
     calc_used: calcUsed || (modeKey === MODE_QUICK ? "Quick" : "Precise"),
-    updated_at: Date.now()
+    updated_at: Date.now(),
+    // Requested: store the date the calculation was made (especially for Precise)
+    updated_date: modeKey === MODE_PRECISE ? todayISO() : (result.updated_date || null)
   };
 
   prev.modes[modeKey] = modeRecord;
+
+  // Prefer Precise for the top-level "display" fields whenever it exists.
+  const displayModeKey = prev.modes[MODE_PRECISE] ? MODE_PRECISE : modeKey;
+  const displayRec = prev.modes[displayModeKey] || modeRecord;
 
   // Top-level compatibility fields (used by saved list sorting / display)
   saved[sym] = {
     symbol: sym,
     modes: prev.modes,
     starred: prevStar,
-    last_run_mode: modeKey,
-    calc_used: modeRecord.calc_used,
 
-    // mirror current mode record for backwards compatibility
-    start_wallet: modeRecord.start_wallet,
-    sell_pct_thresh: modeRecord.sell_pct_thresh,
-    buy_pct_thresh: modeRecord.buy_pct_thresh,
-    position_scale: modeRecord.position_scale,
-    min_hold_days: modeRecord.min_hold_days,
-    long_term_ratio: modeRecord.long_term_ratio,
-    long_term_min_hold_days: modeRecord.long_term_min_hold_days,
-    regime_sensitivity: modeRecord.regime_sensitivity,
-    regime_window_days: modeRecord.regime_window_days,
-    regime_trend_days: modeRecord.regime_trend_days,
-    regime_range_pct: modeRecord.regime_range_pct,
-    profit: modeRecord.profit,
-    last_decision: modeRecord.last_decision,
-    last_amount: modeRecord.last_amount,
-    last_action_price: modeRecord.last_action_price,
-    last_price: modeRecord.last_price
+    // Always prefer Precise as the "default" mode once it exists
+    last_run_mode: displayModeKey,
+    calc_used: displayRec.calc_used,
+    updated_at: displayRec.updated_at || null,
+    updated_date: displayRec.updated_date || null,
+
+    // mirror display record for backwards compatibility
+    start_wallet: displayRec.start_wallet,
+    sell_pct_thresh: displayRec.sell_pct_thresh,
+    buy_pct_thresh: displayRec.buy_pct_thresh,
+    position_scale: displayRec.position_scale,
+    min_hold_days: displayRec.min_hold_days,
+    long_term_ratio: displayRec.long_term_ratio,
+    long_term_min_hold_days: displayRec.long_term_min_hold_days,
+    regime_sensitivity: displayRec.regime_sensitivity,
+    regime_window_days: displayRec.regime_window_days,
+    regime_trend_days: displayRec.regime_trend_days,
+    regime_range_pct: displayRec.regime_range_pct,
+    profit: displayRec.profit,
+    last_decision: displayRec.last_decision,
+    last_amount: displayRec.last_amount,
+    last_action_price: displayRec.last_action_price,
+    last_price: displayRec.last_price
   };
 
   saveSaved(saved);
@@ -2114,34 +2653,46 @@ async function runForInput(
       // QUICK mode: same threshold/param search as Precise, but with a single fixed wallet
       const quickWallet = QUICK_START_WALLET;
 
-      if (savedMode && !forceReoptimize) {
-        setProgress(20, "Using cached Quick settings");
+      // If Quick isn't cached, fall back to using Precise cached thresholds/settings (per request: Precise is the source of truth)
+      const baseSaved = savedMode || savedPrecise || null;
+
+      if (baseSaved && !forceReoptimize) {
+        const usingPreciseFallback = !savedMode && !!savedPrecise;
+        setProgress(20, usingPreciseFallback ? "Using cached Precise settings (Quick wallet)" : "Using cached Quick settings");
 
         const options = {
           positionScale:
-            typeof savedMode.position_scale === "number" ? savedMode.position_scale : 1.0,
+            typeof baseSaved.position_scale === "number" ? baseSaved.position_scale : 1.0,
           minHoldDays:
-            typeof savedMode.min_hold_days === "number" ? savedMode.min_hold_days : 0,
+            typeof baseSaved.min_hold_days === "number" ? baseSaved.min_hold_days : 0,
           longTermRatio:
-            typeof savedMode.long_term_ratio === "number" ? savedMode.long_term_ratio : 0.0,
+            typeof baseSaved.long_term_ratio === "number" ? baseSaved.long_term_ratio : 0.0,
           longTermMinHoldDays:
-            typeof savedMode.long_term_min_hold_days === "number"
-              ? savedMode.long_term_min_hold_days
-              : 0
+            typeof baseSaved.long_term_min_hold_days === "number"
+              ? baseSaved.long_term_min_hold_days
+              : 0,
+          regimeSensitivity:
+            typeof baseSaved.regime_sensitivity === "number" ? baseSaved.regime_sensitivity : REGIME_SENS_DEFAULT,
+          regimeWindowDays:
+            typeof baseSaved.regime_window_days === "number" ? baseSaved.regime_window_days : REGIME_WINDOW_DAYS,
+          regimeTrendDays:
+            typeof baseSaved.regime_trend_days === "number" ? baseSaved.regime_trend_days : REGIME_TREND_DAYS,
+          regimeRangePct:
+            typeof baseSaved.regime_range_pct === "number" ? baseSaved.regime_range_pct : REGIME_RANGE_PCT
         };
 
         bestResult = biasedTrader(
           prices,
           quickWallet,
-          savedMode.sell_pct_thresh,
-          savedMode.buy_pct_thresh,
+          baseSaved.sell_pct_thresh,
+          baseSaved.buy_pct_thresh,
           MAX_LOOKBACK_DAYS,
           options
         );
 
         bestResult.start_wallet = quickWallet;
-        bestResult.sell_pct_thresh = savedMode.sell_pct_thresh;
-        bestResult.buy_pct_thresh = savedMode.buy_pct_thresh;
+        bestResult.sell_pct_thresh = baseSaved.sell_pct_thresh;
+        bestResult.buy_pct_thresh = baseSaved.buy_pct_thresh;
         bestResult.position_scale = options.positionScale;
         bestResult.min_hold_days = options.minHoldDays;
         bestResult.long_term_ratio = options.longTermRatio;
@@ -2152,8 +2703,11 @@ async function runForInput(
         bestResult.regime_trend_days = options.regimeTrendDays ?? REGIME_TREND_DAYS;
         bestResult.regime_range_pct = options.regimeRangePct ?? REGIME_RANGE_PCT;
 
-        calcUsed = savedMode.calc_used || "Quick (cached settings)";
-        setProgress(100, "Using cached Quick settings");
+        calcUsed = usingPreciseFallback
+          ? (baseSaved.calc_used ? `Quick (from Precise cached settings: ${baseSaved.calc_used})` : "Quick (from Precise cached settings)")
+          : (baseSaved.calc_used || "Quick (cached settings)");
+
+        setProgress(100, usingPreciseFallback ? "Using cached Precise settings (Quick wallet)" : "Using cached Quick settings");
       } else {
         setProgress(10, "Optimizing thresholds (Quick, fixed wallet)...");
         bestResult = await gridSearchThresholdsFixedWalletWithProgress(
@@ -2212,31 +2766,67 @@ async function runForInput(
       usedStartWallet
     );
 
-    // ---------- DECISION TEXT ----------
-    const decision = bestResult.last_decision;
-    const amount = bestResult.last_amount;
-    const actionPrice = bestResult.last_action_price;
+    // ---------- DECISION TEXT (Signal-based, sized Low/Med/High) ----------
+    // NOTE: biasedTrader's last_decision/last_amount reflect the last EXECUTED trade,
+    // which can become HOLD when the simulated wallet is depleted. We compute a separate
+    // wallet-independent signal based on the optimized thresholds + latest trend.
+    const portfolioSnap = {
+      wallet: Array.isArray(walletSeries) && walletSeries.length ? walletSeries[walletSeries.length - 1] : bestResult.final_wallet,
+      shares: Array.isArray(sharesHeld) && sharesHeld.length ? sharesHeld[sharesHeld.length - 1] : 0
+    };
 
-    let decisionMain;
-    if (decision === "BUY" && amount > 0) {
-      decisionMain = `BUY ${amount} shares`;
-    } else if (decision === "SELL" && amount > 0) {
-      decisionMain = `SELL ${amount} shares`;
-    } else {
-      decisionMain = "HOLD";
+    const execDecision = bestResult.last_decision;
+    const execAmount = bestResult.last_amount;
+
+    const signal = computeSignalSizedDecision(prices, bestResult, portfolioSnap);
+
+    // Store both (debuggable), but use the signal for UI + saving.
+    bestResult.exec_last_decision = execDecision;
+    bestResult.exec_last_amount = execAmount;
+    bestResult.signal_score = signal.score;
+    bestResult.signal_reason = signal.reason;
+    bestResult.signal_suggested_shares = signal.suggestedShares;
+
+    bestResult.last_decision = signal.decision;
+    bestResult.last_amount = signal.size || "";
+    bestResult.last_action_price = bestResult.last_price; // latest price (we're signaling "now")
+
+    let decisionMain = "HOLD";
+    if (signal.decision === "BUY" || signal.decision === "SELL") {
+      const sizeText = signal.size ? ` (${signal.size})` : "";
+      const sharesText =
+        (typeof signal.suggestedShares === "number" && signal.suggestedShares > 0)
+          ? ` ~${signal.suggestedShares} sh`
+          : "";
+      decisionMain = `${signal.decision}${sizeText}${sharesText}`;
     }
 
     decisionText.textContent = decisionMain;
     decisionText.style.color =
-      decision === "BUY" ? "#4ade80" : decision === "SELL" ? "#f97373" : "#9ca3af";
+      signal.decision === "BUY" ? "#4ade80" : signal.decision === "SELL" ? "#f97373" : "#9ca3af";
 
-    if ((decision === "BUY" || decision === "SELL") && amount > 0 && isFinite(actionPrice)) {
-      decisionExtra.textContent = `$${actionPrice.toFixed(2)}`;
+    // show latest price; (optional) keep this simple so UI stays clean
+    // show latest price + avg win/loss from the chart simulation
+    const wl = computeAvgWinLossFromMarkers(prices, buyMarkers, sellMarkers);
+    if (wl && (isFinite(wl.avgWinPct) || isFinite(wl.avgLossPct))) {
+      const fmtPct = (v) =>
+        (typeof v === "number" && isFinite(v)) ? `${v.toFixed(2)}%` : "–";
+
+      // store for debugging / future UI use
+      bestResult.avg_win_pct = wl.avgWinPct;
+      bestResult.avg_loss_pct = wl.avgLossPct;
+      bestResult.win_samples = wl.winSamples;
+      bestResult.loss_samples = wl.lossSamples;
+
+      decisionExtra.innerHTML =
+        `<div>$${bestResult.last_price.toFixed(2)}</div>` +
+        `<div style="opacity:0.9; font-size:0.75rem;">Avg win: ${fmtPct(wl.avgWinPct)} • Avg loss: ${fmtPct(Math.abs(wl.avgLossPct))}</div>`;
     } else {
+      // fallback
       decisionExtra.textContent = `$${bestResult.last_price.toFixed(2)}`;
     }
 
-    // ---------- THRESHOLDS TEXT ----------
+// ---------- THRESHOLDS TEXT ----------
     thresholdsText.textContent = `Sell > ${bestResult.sell_pct_thresh.toFixed(
       1
     )}%, Buy drop > ${bestResult.buy_pct_thresh.toFixed(1)}%`;
@@ -2315,14 +2905,91 @@ runButton.addEventListener("click", () => {
   runForInput(val);
 });
 
+// --- Reload click timers (so dblclick can cancel the single-click behavior) ---
+const _reloadClickTimers = new Map();
+
+function clearSavedCalculationsForSymbol(symbol) {
+  const sym = (symbol || "").toUpperCase();
+  if (!sym) return;
+
+  const saved = loadSaved();
+  const rec = saved[sym];
+  if (!rec || typeof rec !== "object") return;
+
+  // Preserve symbol + starred, wipe cached calculations/settings
+  const starred = !!rec.starred;
+  rec.symbol = sym;
+  rec.starred = starred;
+  rec.modes = {};
+
+  // Remove top-level compatibility fields so we truly "delete calculations"
+  const wipeKeys = [
+    "start_wallet",
+    "sell_pct_thresh",
+    "buy_pct_thresh",
+    "position_scale",
+    "min_hold_days",
+    "long_term_ratio",
+    "long_term_min_hold_days",
+    "regime_sensitivity",
+    "regime_window_days",
+    "regime_trend_days",
+    "regime_range_pct",
+    "profit",
+    "last_decision",
+    "last_amount",
+    "last_action_price",
+    "last_price",
+    "calc_used",
+    "last_run_mode",
+    "updated_at",
+    "updated_date"
+  ];
+  for (const k of wipeKeys) {
+    if (k in rec) delete rec[k];
+  }
+
+  saved[sym] = rec;
+  saveSaved(saved);
+}
+
+function clearPriceCacheForSymbol(symbol) {
+  const sym = (symbol || "").toUpperCase();
+  if (!sym) return;
+
+  try {
+    const cache = loadPriceCache();
+    if (cache && typeof cache === "object" && cache[sym]) {
+      delete cache[sym];
+      localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
 savedList.addEventListener("click", (e) => {
-  // Reload button: re-run simulation from scratch (ignore cached thresholds)
+  // Reload button:
+  // - single click: reuse cached calcs (no forceReoptimize), but still fetch latest prices if cache is stale (getStockData handles this)
+  // - shift+click: force reoptimize (existing behavior)
   const reload = e.target.closest(".saved-reload");
   if (reload) {
     const sym = reload.dataset.symbol;
     if (sym) {
-      input.value = sym;
-      runForInput(sym, { mode: getSelectedMode(), forceReoptimize: e.shiftKey });
+      // Delay the single-click action to give dblclick a chance to cancel it
+      const key = sym.toUpperCase();
+      if (_reloadClickTimers.has(key)) {
+        clearTimeout(_reloadClickTimers.get(key));
+        _reloadClickTimers.delete(key);
+      }
+
+      const t = setTimeout(() => {
+        _reloadClickTimers.delete(key);
+        input.value = sym;
+        runForInput(sym, { mode: getSelectedMode(), forceReoptimize: e.shiftKey });
+      }, 320);
+
+      _reloadClickTimers.set(key, t);
     }
     e.stopPropagation();
     return;
@@ -2349,22 +3016,18 @@ savedList.addEventListener("click", (e) => {
   const sym = btn.dataset.symbol;
   if (!sym) return;
 
-  if (currentSymbol && sym.toUpperCase() === currentSymbol.toUpperCase()) {
-    return; // already selected
-  }
-
   input.value = sym;
 
-  // When switching between saved stocks, always use whatever mode that stock
-  // was last calculated with (so we don't "flip" a stock's results just because
-  // the global toggle is currently on Quick/Precise).
+  // Prefer whichever mode was last calculated with (so we don't "flip" a stock's results just because the toggle was changed)
   const saved = loadSaved();
   const rec = saved[(sym || "").toUpperCase()];
   let preferredMode = null;
 
   if (rec) {
-    // Primary: last_run_mode
-    if (rec.last_run_mode === MODE_QUICK || rec.last_run_mode === MODE_PRECISE) {
+    // Primary: last_run_mode (but we also prefer precise if it exists)
+    if (rec.modes && rec.modes[MODE_PRECISE]) {
+      preferredMode = MODE_PRECISE;
+    } else if (rec.last_run_mode === MODE_QUICK || rec.last_run_mode === MODE_PRECISE) {
       preferredMode = rec.last_run_mode;
     } else if (rec.modes) {
       // Fallback: pick whichever exists (prefer precise if present)
@@ -2376,10 +3039,42 @@ savedList.addEventListener("click", (e) => {
   runForInput(sym, preferredMode ? { mode: preferredMode } : undefined);
 });
 
-clearSavedBtn.addEventListener("click", () => {
-  localStorage.removeItem(STORAGE_KEY);
-  renderSavedList();
+// Double-click reload: clear cached calcs + cached prices, then re-run in the currently selected mode
+savedList.addEventListener("dblclick", (e) => {
+  const reload = e.target.closest(".saved-reload");
+  if (!reload) return;
+
+  const sym = reload.dataset.symbol;
+  if (!sym) return;
+
+  const key = sym.toUpperCase();
+  if (_reloadClickTimers.has(key)) {
+    clearTimeout(_reloadClickTimers.get(key));
+    _reloadClickTimers.delete(key);
+  }
+
+  clearSavedCalculationsForSymbol(sym);
+  clearPriceCacheForSymbol(sym);
+
+  input.value = sym;
+  runForInput(sym, { mode: getSelectedMode(), forceReoptimize: true });
+
+  e.stopPropagation();
+  e.preventDefault();
 });
+
+if (clearSavedBtn) {
+  clearSavedBtn.addEventListener("click", () => {
+    localStorage.removeItem(STORAGE_KEY);
+    renderSavedList();
+  });
+}
+
+if (reloadSavedBtn) {
+  reloadSavedBtn.addEventListener("click", () => {
+    reloadAllSavedSymbolsApplyOnly();
+  });
+}
 
 // ================== SANDBOX: PORTFOLIO PLAYGROUND ==================
 
@@ -2701,6 +3396,23 @@ renderSavedList();
   const sym = firstBtn.dataset.symbol;
   if (!sym) return;
 
+  // Prefer Precise on startup for the top symbol if it exists
+  try {
+    const saved = loadSaved();
+    const rec = saved[(sym || "").toUpperCase()];
+    const hasPrecise = rec && rec.modes && rec.modes[MODE_PRECISE];
+
+    if (hasPrecise) {
+      setSelectedMode(MODE_PRECISE);
+      input.value = sym;
+      runForInput(sym, { mode: MODE_PRECISE });
+      return;
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  // fallback: run with current mode
   input.value = sym;
   runForInput(sym);
 })();
