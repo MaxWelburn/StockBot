@@ -9,7 +9,7 @@ const MODE_PRECISE = "precise";
 const QUICK_START_WALLET = 4000.0;
 
 // Bulk reload: start the next symbol every N ms (staggered concurrency)
-const RELOAD_ALL_STAGGER_MS = 2000;
+const RELOAD_ALL_STAGGER_MS = 500;
 
 
 // Regime / mean-reversion scaling (helps avoid buying tiny dips after huge run-ups,
@@ -183,7 +183,8 @@ let priceChart = null;
 // Track which symbol is currently shown on the main chart
 let currentSymbol = null;
 // Progress & ETA state
-let currentProgressPercent = 0;    // internal 0–100
+let currentProgressPercent = 0;
+let reloadAllInProgress = false;    // internal 0–100
 let etaStartTime = null;           // when the bar first moved
 let etaStartDisplayPercent = 0;    // bar percent at that time (usually 0)
 let etaAvgMsPerPercent = null;     // smoothed *average* ms per 1% of the BAR
@@ -278,7 +279,14 @@ function setStatus(msg, isError = false) {
   statusEl.className = "status" + (isError ? " error" : "");
 }
 
-function setProgress(percent, label) {
+function setProgress(percent, label, opts) {
+  opts = opts || {};
+  const scope = opts.scope || "default";
+  const raw = !!opts.raw;
+
+  // During reload-all, only allow the global updater to touch the bar/text.
+  if (reloadAllInProgress && scope !== "reloadAll") return;
+
   // Internal progress (0–100) from the pipeline / grid search
   const p = Math.max(0, Math.min(100, percent));
   currentProgressPercent = p;
@@ -286,7 +294,9 @@ function setProgress(percent, label) {
   // Map internal progress to displayed bar percent:
   // 0–60 internal → 0–99 visual, 60–100 internal → hold at 99 until done.
   let displayPercent;
-  if (p <= 0) {
+  if (raw) {
+    displayPercent = p;
+  } else if (p <= 0) {
     displayPercent = 0;
   } else if (p < 60) {
     displayPercent = Math.round((p / 60) * 99);
@@ -801,8 +811,18 @@ function runUsingExistingCalcs(prices, modeKey, modeRec) {
   res.signal_reason = signal.reason;
   res.signal_suggested_shares = signal.suggestedShares;
 
-  res.last_decision = signal.decision;
-  res.last_amount = signal.size || "";
+  const isHighStrength =
+    (signal.size === SIZE_HIGH) || (String(signal.size || "").toUpperCase() === "HIGH");
+  const finalDecision =
+    ((signal.decision === "BUY" || signal.decision === "SELL") && isHighStrength)
+      ? signal.decision
+      : "HOLD";
+
+  res.signal_size = signal.size || null;
+
+  // High-only action: only show/save BUY/SELL when strength is HIGH; otherwise HOLD.
+  res.last_decision = finalDecision;
+  res.last_amount = "";
   res.last_action_price = res.last_price;
 
   return res;
@@ -871,13 +891,14 @@ async function reloadAllSavedSymbolsApplyOnly() {
 
   reloadSavedBtn.disabled = true;
   runButton.disabled = true;
+  reloadAllInProgress = true;
 
   let completed = 0;
   const total = symbols.length;
 
   try {
     setStatus(`Reloading ${total} saved symbol(s)...`);
-    setProgress(0, `Reloading ${total} symbol(s)...`);
+    setProgress(0, `Reloading ${total} symbol(s)...`, { raw: true, scope: "reloadAll" });
 
     // Start each symbol after RELOAD_ALL_STAGGER_MS, without waiting for the prior one to finish.
     const tasks = symbols.map((sym, idx) => {
@@ -917,8 +938,8 @@ async function reloadAllSavedSymbolsApplyOnly() {
             console.warn(`[Reload all] ${upper} failed:`, e);
           } finally {
             completed++;
-            const pct = Math.round((completed * 100) / total);
-            setProgress(pct, `Reloaded ${completed}/${total}`);
+            const pct = total > 0 ? Math.round((completed * 100) / total) : 100;
+            setProgress(pct, `Reloaded ${completed}/${total}`, { raw: true, scope: "reloadAll" });
             resolve();
           }
         }, idx * RELOAD_ALL_STAGGER_MS);
@@ -930,8 +951,9 @@ async function reloadAllSavedSymbolsApplyOnly() {
     saveSaved(saved);
     renderSavedList();
     setStatus("Reload complete.");
-    setProgress(100, "Reload complete.");
+    setProgress(100, "Reload complete.", { raw: true, scope: "reloadAll" });
   } finally {
+    reloadAllInProgress = false;
     reloadSavedBtn.disabled = false;
     runButton.disabled = false;
   }
@@ -2810,7 +2832,7 @@ async function runForInput(
     const wl = computeAvgWinLossFromMarkers(prices, buyMarkers, sellMarkers);
     if (wl && (isFinite(wl.avgWinPct) || isFinite(wl.avgLossPct))) {
       const fmtPct = (v) =>
-        (typeof v === "number" && isFinite(v)) ? `${v.toFixed(2)}%` : "–";
+        (typeof v === "number" && isFinite(v)) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "–";
 
       // store for debugging / future UI use
       bestResult.avg_win_pct = wl.avgWinPct;
@@ -2820,7 +2842,7 @@ async function runForInput(
 
       decisionExtra.innerHTML =
         `<div>$${bestResult.last_price.toFixed(2)}</div>` +
-        `<div style="opacity:0.9; font-size:0.75rem;">Avg win: ${fmtPct(wl.avgWinPct)} • Avg loss: ${fmtPct(Math.abs(wl.avgLossPct))}</div>`;
+        `<div style="opacity:0.9; font-size:0.75rem;">Avg win: ${fmtPct(wl.avgWinPct)} • Avg loss: ${fmtPct(wl.avgLossPct)}</div>`;
     } else {
       // fallback
       decisionExtra.textContent = `$${bestResult.last_price.toFixed(2)}`;
