@@ -18,6 +18,32 @@ const REGIME_SENS_DEFAULT = 1.0;     // 0 disables; 1 = normal; >1 stronger
 const REGIME_WINDOW_DAYS = 10;       // rolling min/max window
 const REGIME_TREND_DAYS = 7;         // multi-day trend window
 const REGIME_RANGE_PCT = 20;         // range% needed to consider a move "huge"
+// ===== Causal smoothing / noise / curve params =====
+// smoothingMethod: "ema" (default) or "none"
+const SMOOTH_METHOD_DEFAULT = "ema";
+
+// EMA base alpha (lower = smoother, higher = more reactive)
+const SMOOTH_ALPHA_BASE_DEFAULT = 0.35;
+
+// Clamp so it never gets "too smooth" (too laggy) or too twitchy
+const SMOOTH_MIN_ALPHA_DEFAULT = 0.15;
+const SMOOTH_MAX_ALPHA_DEFAULT = 0.75;
+
+// Noise estimate = avg absolute daily return% over last N days
+const SMOOTH_NOISE_LOOKBACK_DAYS_DEFAULT = 7;
+
+// “Rigidity” target: if noise% > this, we treat it as noisy/unreliable
+const SMOOTH_RIGIDITY_PCT_DEFAULT = 1.25;
+
+// How aggressively alpha shrinks when noise rises above rigidity
+const SMOOTH_ADAPT_STRENGTH_DEFAULT = 1.2;
+
+// When noisy, scale thresholds up and position size down by this strength
+const NOISE_PENALTY_STRENGTH_DEFAULT = 0.8;
+
+// Curve detection (slope + acceleration) over last N days
+const CURVE_LOOKBACK_DAYS_DEFAULT = 6;
+const CURVE_WEIGHT_DEFAULT = 0.5;
 
 const MAX_LOOKBACK_DAYS = 30;
 const STORAGE_KEY = "biasTraderSavedV7";
@@ -419,7 +445,7 @@ function setProgress(percent, label, opts) {
   if (!isGridSearch) {
     const baseLabel = label || "Progress";
     if (progressText) {
-      progressText.textContent = `${baseLabel} (${displayPercent}%)`;
+      progressText.textContent = `Progress: ${displayPercent}%`;
     }
     return;
   }
@@ -469,6 +495,28 @@ function isAfterDailyRefreshCutoff() {
 
 function clamp(val, min, max) {
   return Math.max(min, Math.min(max, val));
+}
+function avgAbsReturnPct(prices, i, lookbackDays) {
+  const lb = Math.max(1, Math.floor(lookbackDays || 1));
+  const start = Math.max(1, i - lb + 1);
+  let sum = 0, n = 0;
+  for (let j = start; j <= i; j++) {
+    const prev = prices[j - 1];
+    const cur = prices[j];
+    if (prev > 0 && isFinite(prev) && isFinite(cur)) {
+      sum += Math.abs((cur - prev) / prev) * 100;
+      n++;
+    }
+  }
+  return n ? (sum / n) : 0;
+}
+
+function slopePct(series, i, lookbackDays) {
+  const k = Math.max(2, Math.floor(lookbackDays || 2));
+  if (i < k) return 0;
+  const ref = series[i - k];
+  if (!(ref > 0)) return 0;
+  return ((series[i] - ref) / ref) * 100;
 }
 
 async function fetchJson(url) {
@@ -1336,66 +1384,198 @@ function biasedTrader(
       : REGIME_RANGE_PCT
   );
 
+  // ===== New: Causal smoothing + noise/curve-aware scaling (NO lookahead) =====
+  // These affect the *decision logic only*. Trades still execute at the real daily close.
+  // - smoothAlpha: EMA alpha. Higher = more reactive (less smooth). Lower = smoother.
+  // - smoothMix: 0 = raw-only decisions, 1 = fully-smoothed decisions, in-between blends.
+  const smoothAlpha = clamp(
+    typeof options.smoothAlpha === "number" ? options.smoothAlpha : 0.35,
+    0.05,
+    0.9
+  );
+  const smoothMix = clamp(
+    typeof options.smoothMix === "number" ? options.smoothMix : 0.65,
+    0.0,
+    1.0
+  );
+
+  // Noise settings: measure average abs daily % move over the last N days.
+  // When noise is high, we get more conservative (need bigger dips to buy, smaller sizing).
+  const noiseWindowDays = Math.max(
+    2,
+    Math.floor(
+      typeof options.noiseWindowDays === "number" ? options.noiseWindowDays : 7
+    )
+  );
+  const noiseTargetPct = Math.max(
+    0.1,
+    typeof options.noiseTargetPct === "number" ? options.noiseTargetPct : 1.2
+  );
+  const noiseSensitivity = clamp(
+    typeof options.noiseSensitivity === "number" ? options.noiseSensitivity : 0.75,
+    0.0,
+    2.0
+  );
+
+  // Curve settings: use smoothed slope + acceleration to avoid catching falling knives
+  // and to hold winners a bit longer in strong uptrends.
+  const curveSensitivity = clamp(
+    typeof options.curveSensitivity === "number" ? options.curveSensitivity : 0.9,
+    0.0,
+    2.0
+  );
+  const curveTrendDays = Math.max(
+    2,
+    Math.floor(
+      typeof options.curveTrendDays === "number" ? options.curveTrendDays : 6
+    )
+  );
+  const curveSlopePct = Math.max(
+    0.5,
+    typeof options.curveSlopePct === "number" ? options.curveSlopePct : 6.0
+  );
+  const curveCurvPct = Math.max(
+    0.1,
+    typeof options.curveCurvPct === "number" ? options.curveCurvPct : 1.5
+  );
+  // ===== New: Weekly (5-trading-day) stats =====
+  const weeklyDays = 5; // treat 5 trading days as a "week"
+
+  const weeklyReturnThreshPct = Math.max(
+    0.5,
+    typeof options.weeklyReturnThreshPct === "number" ? options.weeklyReturnThreshPct : 4.0
+  );
+
+  const weeklyRangeTargetPct = Math.max(
+    1.0,
+    typeof options.weeklyRangeTargetPct === "number" ? options.weeklyRangeTargetPct : 6.0
+  );
+
+  // how much weekly trend influences thresholds/sizing
+  const weeklyTrendWeight = clamp(
+    typeof options.weeklyTrendWeight === "number" ? options.weeklyTrendWeight : 0.7,
+    0.0, 2.0
+  );
+
+  // how much weekly "near-high/near-low" mean-reversion influences thresholds
+  const weeklyReversionWeight = clamp(
+    typeof options.weeklyReversionWeight === "number" ? options.weeklyReversionWeight : 0.55,
+    0.0, 2.0
+  );
+
+  // reduce aggression in very wide weekly ranges (optional)
+  const weeklyVolPenaltyWeight = clamp(
+    typeof options.weeklyVolPenaltyWeight === "number" ? options.weeklyVolPenaltyWeight : 0.35,
+    0.0, 2.0
+  );
+
+  // breakout rule: if today breaks above prior week's high by this %, hold winners longer
+  const weeklyBreakoutPct = Math.max(
+    0.0,
+    typeof options.weeklyBreakoutPct === "number" ? options.weeklyBreakoutPct : 1.0
+  );
+
+  // Precompute causal EMA + blended "decision price" series (still no lookahead).
+  const smoothPrices = new Array(prices.length);
+  const decisionPrices = new Array(prices.length);
+
+  const safePrice = (v, fallback) => {
+    if (typeof v === "number" && isFinite(v) && v > 0) return v;
+    return typeof fallback === "number" && isFinite(fallback) && fallback > 0
+      ? fallback
+      : 0;
+  };
+
+  smoothPrices[0] = safePrice(prices[0], 0);
+  decisionPrices[0] = smoothPrices[0];
+
+  for (let i = 1; i < prices.length; i++) {
+    const raw = safePrice(prices[i], prices[i - 1]);
+    const prevS = safePrice(smoothPrices[i - 1], raw);
+    const s = prevS * (1 - smoothAlpha) + raw * smoothAlpha;
+    smoothPrices[i] = s;
+
+    // Blend raw + smoothed for decisions (lets you avoid "too smooth")
+    decisionPrices[i] = raw * (1 - smoothMix) + s * smoothMix;
+  }
 
   let wallet = startWallet;
 
-  // each lot: { buyPrice, amount, buyIndex, isLong }
+  // each lot: { buyPrice, buyDecisionPrice, amount, buyIndex, isLong }
   let lots = [];
 
   let lastDecision = "HOLD";
   let lastAmount = 0;
-  let lastActionPrice = prices[0];
+  let lastActionPrice = 0;
 
-  const equityCurve = trackCurve ? [] : null;
-  const buyMarkers = trackCurve ? new Array(prices.length).fill(0) : null;
-  const sellMarkers = trackCurve ? new Array(prices.length).fill(0) : null;
-  const sharesHeld = trackCurve ? new Array(prices.length).fill(0) : null;
-  const walletSeries = trackCurve ? new Array(prices.length).fill(0) : null;
+  // optional arrays for chart + debug
+  let equityCurve = null;
+  let buyMarkers = null;
+  let sellMarkers = null;
+  let sharesHeld = null;
+  let walletSeries = null;
 
-  // day 0 snapshot
   if (trackCurve) {
-    const p0 = prices[0];
+    equityCurve = [];
+    buyMarkers = new Array(prices.length).fill(0);
+    sellMarkers = new Array(prices.length).fill(0);
+    sharesHeld = new Array(prices.length).fill(0);
+    walletSeries = new Array(prices.length).fill(0);
+
+    const p0 = safePrice(prices[0], 0);
     const totalShares0 = lots.reduce((acc, lot) => acc + lot.amount, 0);
     const totalVal0 = wallet + totalShares0 * p0;
+
     equityCurve.push(totalVal0);
     sharesHeld[0] = totalShares0;
     walletSeries[0] = wallet;
   }
 
   for (let i = 1; i < prices.length; i++) {
-    const price = prices[i];
+    const rawPrice = safePrice(prices[i], prices[i - 1]);
+    const dPrice = safePrice(decisionPrices[i], rawPrice);
 
     lastDecision = "HOLD";
     lastAmount = 0;
     lastActionPrice = 0;
 
     // ===== Regime scaling (multi-day range + trend) =====
-    // Compute rolling min/max over a short window to detect "huge" run-ups/drawdowns.
     const wStart = Math.max(0, i - regimeWindowDays);
     let wMin = Infinity;
     let wMax = -Infinity;
     for (let j = wStart; j <= i; j++) {
-      const v = prices[j];
-      if (v < wMin) wMin = v;
-      if (v > wMax) wMax = v;
+      const v = decisionPrices[j];
+      if (v > 0) {
+        if (v < wMin) wMin = v;
+        if (v > wMax) wMax = v;
+      }
+    }
+    if (!isFinite(wMin) || !isFinite(wMax) || wMin <= 0) {
+      wMin = dPrice;
+      wMax = dPrice;
     }
 
     const wRange = wMax - wMin;
     const rangePct = wMin > 0 ? (wRange / wMin) * 100 : 0;
-    const posInRange = wRange > 0 ? (price - wMin) / wRange : 0.5;
+    const posInRange = wRange > 0 ? (dPrice - wMin) / wRange : 0.5;
 
     const tIdx = Math.max(0, i - regimeTrendDays);
-    const tRef = prices[tIdx];
-    const trendPct = tRef > 0 ? ((price - tRef) / tRef) * 100 : 0;
+    const tRef = decisionPrices[tIdx];
+    const trendPct = tRef > 0 ? ((dPrice - tRef) / tRef) * 100 : 0;
 
-    const rangeStrength = clamp((rangePct - regimeRangePct) / regimeRangePct, 0, 2) / 2; // 0..1
+    const rangeStrength =
+      clamp((rangePct - regimeRangePct) / regimeRangePct, 0, 2) / 2; // 0..1
     const posHighStrength = clamp((posInRange - 0.75) / 0.25, 0, 1);
     const posLowStrength = clamp((0.25 - posInRange) / 0.25, 0, 1);
-    const trendUpStrength = clamp((trendPct - regimeRangePct) / regimeRangePct, 0, 2) / 2;
-    const trendDownStrength = clamp(((-trendPct) - regimeRangePct) / regimeRangePct, 0, 2) / 2;
+    const trendUpStrength =
+      clamp((trendPct - regimeRangePct) / regimeRangePct, 0, 2) / 2;
+    const trendDownStrength =
+      clamp(((-trendPct) - regimeRangePct) / regimeRangePct, 0, 2) / 2;
 
-    const overextendedStrength = rangeStrength * Math.max(posHighStrength, trendUpStrength);
-    const oversoldStrength = rangeStrength * Math.max(posLowStrength, trendDownStrength);
+    const overextendedStrength =
+      rangeStrength * Math.max(posHighStrength, trendUpStrength);
+    const oversoldStrength =
+      rangeStrength * Math.max(posLowStrength, trendDownStrength);
 
     // Adjust thresholds and position sizing dynamically.
     let effSellPctThresh = sellPctThresh;
@@ -1403,8 +1583,8 @@ function biasedTrader(
     let effPositionScale = positionScale;
 
     if (overextendedStrength > 0) {
-      // After huge run-ups, require a larger drop to buy, and optionally sell a bit earlier.
-      effBuyPctThresh = buyPctThresh * (1 + regimeSensitivity * 1.25 * overextendedStrength);
+      effBuyPctThresh =
+        buyPctThresh * (1 + regimeSensitivity * 1.25 * overextendedStrength);
       effSellPctThresh = Math.max(
         0.5,
         sellPctThresh * (1 - regimeSensitivity * 0.25 * overextendedStrength)
@@ -1415,7 +1595,6 @@ function biasedTrader(
         4.0
       );
     } else if (oversoldStrength > 0) {
-      // After huge dips, allow buying earlier and a bit larger (mean-reversion bias).
       effBuyPctThresh = Math.max(
         0.5,
         buyPctThresh * (1 - regimeSensitivity * 0.45 * oversoldStrength)
@@ -1427,6 +1606,190 @@ function biasedTrader(
       );
     }
 
+    // ===== New: Noise-aware scaling =====
+    const nStart = Math.max(1, i - noiseWindowDays + 1);
+    let absSum = 0;
+    let absN = 0;
+    for (let j = nStart; j <= i; j++) {
+      const a = decisionPrices[j - 1];
+      const b = decisionPrices[j];
+      if (a > 0 && b > 0) {
+        absSum += Math.abs(((b - a) / a) * 100);
+        absN++;
+      }
+    }
+    const noisePct = absN > 0 ? absSum / absN : 0;
+    const noiseStrength =
+      clamp((noisePct - noiseTargetPct) / noiseTargetPct, 0, 2) / 2; // 0..1
+
+    if (noiseStrength > 0) {
+      effBuyPctThresh = Math.max(
+        0.5,
+        effBuyPctThresh * (1 + noiseSensitivity * 0.8 * noiseStrength)
+      );
+      effSellPctThresh = Math.max(
+        0.5,
+        effSellPctThresh * (1 - noiseSensitivity * 0.15 * noiseStrength)
+      );
+      effPositionScale = clamp(
+        effPositionScale * (1 - noiseSensitivity * 0.6 * noiseStrength),
+        0.25,
+        4.0
+      );
+    }
+
+    // ===== New: Curve-aware scaling =====
+    const cIdx = Math.max(0, i - curveTrendDays);
+    const cRef = decisionPrices[cIdx];
+    const slopePct = cRef > 0 ? ((dPrice - cRef) / cRef) * 100 : 0;
+
+    const iPrev = Math.max(1, i - 1);
+    const cPrevIdx = Math.max(0, iPrev - curveTrendDays);
+    const cPrevRef = decisionPrices[cPrevIdx];
+    const slopePrevPct =
+      cPrevRef > 0 ? ((decisionPrices[iPrev] - cPrevRef) / cPrevRef) * 100 : 0;
+
+    const curvPct = slopePct - slopePrevPct;
+
+    const upStrength = slopePct > 0
+      ? (clamp((slopePct - curveSlopePct) / curveSlopePct, 0, 2) / 2)
+      : 0;
+    const downStrength = slopePct < 0
+      ? (clamp(((-slopePct) - curveSlopePct) / curveSlopePct, 0, 2) / 2)
+      : 0;
+
+    const accelUpStrength = curvPct > 0
+      ? (clamp((curvPct - curveCurvPct) / curveCurvPct, 0, 2) / 2)
+      : 0;
+    const accelDownStrength = curvPct < 0
+      ? (clamp(((-curvPct) - curveCurvPct) / curveCurvPct, 0, 2) / 2)
+      : 0;
+
+    const curveUp = clamp(upStrength * (0.6 + 0.4 * accelUpStrength), 0, 1);
+    const curveDown = clamp(downStrength * (0.6 + 0.4 * accelDownStrength), 0, 1);
+
+    if (curveUp > 0) {
+      effSellPctThresh = Math.max(
+        0.5,
+        effSellPctThresh * (1 + curveSensitivity * 0.6 * curveUp)
+      );
+      effBuyPctThresh = Math.max(
+        0.5,
+        effBuyPctThresh * (1 - curveSensitivity * 0.15 * curveUp)
+      );
+      effPositionScale = clamp(
+        effPositionScale * (1 + curveSensitivity * 0.2 * curveUp),
+        0.25,
+        4.0
+      );
+    } else if (curveDown > 0) {
+      effSellPctThresh = Math.max(
+        0.5,
+        effSellPctThresh * (1 - curveSensitivity * 0.35 * curveDown)
+      );
+      effBuyPctThresh = Math.max(
+        0.5,
+        effBuyPctThresh * (1 + curveSensitivity * 0.75 * curveDown)
+      );
+      effPositionScale = clamp(
+        effPositionScale * (1 - curveSensitivity * 0.5 * curveDown),
+        0.25,
+        4.0
+      );
+    }
+    // ===== Weekly (5 trading day) features: trend + range position + breakout =====
+    if (i >= weeklyDays) {
+      // current week window: (i-4..i)
+      const w0 = Math.max(0, i - (weeklyDays - 1));
+      let weekHigh = -Infinity, weekLow = Infinity;
+      for (let j = w0; j <= i; j++) {
+        const v = decisionPrices[j];
+        if (v > 0) {
+          if (v > weekHigh) weekHigh = v;
+          if (v < weekLow)  weekLow = v;
+        }
+      }
+      if (!isFinite(weekHigh) || !isFinite(weekLow) || weekLow <= 0) {
+        weekHigh = dPrice;
+        weekLow = dPrice;
+      }
+
+      const weekRange = weekHigh - weekLow;
+      const weekRangePct = weekLow > 0 ? (weekRange / weekLow) * 100 : 0;
+      const weekPos = weekRange > 0 ? (dPrice - weekLow) / weekRange : 0.5; // 0..1
+
+      const ref = decisionPrices[i - weeklyDays];
+      const weekRetPct = (ref > 0) ? ((dPrice - ref) / ref) * 100 : 0;
+
+      // Normalize strengths 0..1
+      const trendStrength = clamp(Math.abs(weekRetPct) / weeklyReturnThreshPct, 0, 2) / 2; // 0..1
+      const rangeStrength = clamp(weekRangePct / weeklyRangeTargetPct, 0, 2) / 2;          // 0..1
+
+      // Trend bias: strong up week => hold winners longer + prefer buying dips
+      // strong down week => sell sooner + avoid buying
+      if (trendStrength > 0) {
+        if (weekRetPct > 0) {
+          // Up week:
+          // - Raise sell threshold a bit (hold winners longer)
+          // - Slightly lower buy threshold (allow buys on dips inside uptrend)
+          // - Slightly increase position scale
+          const amt = weeklyTrendWeight * 0.18 * trendStrength; // tune
+          effSellPctThresh = Math.max(0.5, effSellPctThresh * (1 + amt));
+          effBuyPctThresh  = Math.max(0.5, effBuyPctThresh  * (1 - 0.35 * amt));
+          effPositionScale = clamp(effPositionScale * (1 + 0.25 * amt), 0.25, 4.0);
+        } else {
+          // Down week:
+          // - Lower sell threshold (exit quicker)
+          // - Raise buy threshold (avoid catching falling knife)
+          // - Reduce position scale
+          const amt = weeklyTrendWeight * 0.22 * trendStrength; // tune
+          effSellPctThresh = Math.max(0.5, effSellPctThresh * (1 - 0.55 * amt));
+          effBuyPctThresh  = Math.max(0.5, effBuyPctThresh  * (1 + amt));
+          effPositionScale = clamp(effPositionScale * (1 - 0.7 * amt), 0.25, 4.0);
+        }
+      }
+
+      // Mean-reversion inside the weekly range:
+      // near weekly high => more willing to sell; near weekly low => more willing to buy
+      if (rangeStrength > 0) {
+        const centerBias = (weekPos - 0.5) * 2; // -1..+1
+        const amt = weeklyReversionWeight * 0.20 * rangeStrength; // tune
+
+        if (centerBias > 0) {
+          // near highs: sell easier, buy harder
+          effSellPctThresh = Math.max(0.5, effSellPctThresh * (1 - amt * centerBias));
+          effBuyPctThresh  = Math.max(0.5, effBuyPctThresh  * (1 + 0.6 * amt * centerBias));
+        } else if (centerBias < 0) {
+          // near lows: buy easier, sell harder
+          effBuyPctThresh  = Math.max(0.5, effBuyPctThresh  * (1 - amt * (-centerBias)));
+          effSellPctThresh = Math.max(0.5, effSellPctThresh * (1 + 0.45 * amt * (-centerBias)));
+        }
+      }
+
+      // Weekly volatility penalty (optional): very wide weekly ranges => reduce sizing
+      if (weeklyVolPenaltyWeight > 0 && weekRangePct > weeklyRangeTargetPct) {
+        const volStr = clamp((weekRangePct - weeklyRangeTargetPct) / weeklyRangeTargetPct, 0, 2) / 2; // 0..1
+        const mult = 1 + weeklyVolPenaltyWeight * 1.2 * volStr;
+        effPositionScale = clamp(effPositionScale / mult, 0.25, 4.0);
+      }
+
+      // Breakout rule (prior week high, past-only):
+      // compare today to max of (i-5..i-1)
+      if (weeklyBreakoutPct > 0 && i >= weeklyDays + 1) {
+        let prevHigh = -Infinity;
+        for (let j = i - weeklyDays; j <= i - 1; j++) {
+          const v = decisionPrices[j];
+          if (v > 0 && v > prevHigh) prevHigh = v;
+        }
+        if (isFinite(prevHigh) && prevHigh > 0) {
+          const brokeOut = dPrice > prevHigh * (1 + weeklyBreakoutPct / 100);
+          if (brokeOut) {
+            // hold winners longer during breakout (discourage premature sells)
+            effSellPctThresh = Math.max(0.5, effSellPctThresh * 1.18);
+          }
+        }
+      }
+    }
 
     // ========== SELL PHASE ==========
     if (lots.length) {
@@ -1435,6 +1798,7 @@ function biasedTrader(
       for (let idx = lots.length - 1; idx >= 0; idx--) {
         const lot = lots[idx];
         const buyPrice = lot.buyPrice;
+        const buyDPrice = lot.buyDecisionPrice;
         const amount = lot.amount;
         if (amount <= 0 || buyPrice <= 0) {
           lots.splice(idx, 1);
@@ -1448,26 +1812,30 @@ function biasedTrader(
         // long-term lots only sell if there are NO short-term lots
         if (lot.isLong && hasShortLots) continue;
 
-        const profitPct = ((price - buyPrice) / buyPrice) * 100;
-        if (buyPrice < price && profitPct > effSellPctThresh) {
-          wallet += amount * price;
+        const signalProfitPct =
+          buyDPrice > 0 ? ((dPrice - buyDPrice) / buyDPrice) * 100 : 0;
+        const realProfitPct =
+          buyPrice > 0 ? ((rawPrice - buyPrice) / buyPrice) * 100 : 0;
+
+        if (rawPrice > buyPrice && signalProfitPct > effSellPctThresh && realProfitPct > 0) {
+          wallet += amount * rawPrice;
           lots.splice(idx, 1);
           lastAmount += amount;
-          lastActionPrice = price;
+          lastActionPrice = rawPrice;
           lastDecision = "SELL";
         }
       }
     }
 
     // ========== BUY PHASE ==========
-    if (wallet > price) {
+    if (wallet > rawPrice) {
       let highestPercent = 0.0;
       const maxBack = clamp(maxLookbackDays + 1, 1, i);
 
       for (let x = 1; x < maxBack; x++) {
-        const prevPrice = prices[i - x];
-        if (price < prevPrice && prevPrice > 0) {
-          const dropPct = ((price - prevPrice) / prevPrice) * 100;
+        const prevD = decisionPrices[i - x];
+        if (dPrice < prevD && prevD > 0) {
+          const dropPct = ((dPrice - prevD) / prevD) * 100;
           if (dropPct < highestPercent) {
             highestPercent = dropPct;
           }
@@ -1479,8 +1847,8 @@ function biasedTrader(
         const maxSteps = Math.floor(Math.abs(highestPercent) * effPositionScale);
 
         for (let step = 1; step <= maxSteps; step++) {
-          if (wallet > price) {
-            wallet -= price;
+          if (wallet > rawPrice) {
+            wallet -= rawPrice;
             amount += 1;
           } else {
             break;
@@ -1494,7 +1862,8 @@ function biasedTrader(
 
           if (shortAmount > 0) {
             lots.push({
-              buyPrice: price,
+              buyPrice: rawPrice,
+              buyDecisionPrice: dPrice,
               amount: shortAmount,
               buyIndex: i,
               isLong: false
@@ -1502,7 +1871,8 @@ function biasedTrader(
           }
           if (longAmount > 0) {
             lots.push({
-              buyPrice: price,
+              buyPrice: rawPrice,
+              buyDecisionPrice: dPrice,
               amount: longAmount,
               buyIndex: i,
               isLong: true
@@ -1510,7 +1880,7 @@ function biasedTrader(
           }
 
           lastAmount = amount;
-          lastActionPrice = price;
+          lastActionPrice = rawPrice;
           lastDecision = "BUY";
         }
       }
@@ -1519,7 +1889,7 @@ function biasedTrader(
     // ========== TRACK CURVE & SERIES ==========
     if (trackCurve) {
       const totalShares = lots.reduce((acc, lot) => acc + lot.amount, 0);
-      const totalVal = wallet + totalShares * price;
+      const totalVal = wallet + totalShares * rawPrice;
 
       equityCurve.push(totalVal);
       sharesHeld[i] = totalShares;
@@ -1533,9 +1903,9 @@ function biasedTrader(
     }
   }
 
-  const finalPrice = prices[prices.length - 1];
-  const totalShares = lots.reduce((acc, lot) => acc + lot.amount, 0);
-  const finalValue = wallet + totalShares * finalPrice;
+  const lastPrice = safePrice(prices[prices.length - 1], prices[prices.length - 2]);
+  const totalSharesFinal = lots.reduce((acc, lot) => acc + lot.amount, 0);
+  const finalValue = wallet + totalSharesFinal * lastPrice;
   const profit = finalValue - startWallet;
 
   return {
@@ -1549,7 +1919,7 @@ function biasedTrader(
     last_decision: lastDecision,
     last_amount: lastAmount,
     last_action_price: lastActionPrice,
-    last_price: finalPrice,
+    last_price: lastPrice,
     equity_curve: equityCurve,
     buy_markers: buyMarkers,
     sell_markers: sellMarkers,
@@ -1562,7 +1932,18 @@ function biasedTrader(
     regime_sensitivity: regimeSensitivity,
     regime_window_days: regimeWindowDays,
     regime_trend_days: regimeTrendDays,
-    regime_range_pct: regimeRangePct
+    regime_range_pct: regimeRangePct,
+
+    // (optional) debug fields
+    smooth_alpha: smoothAlpha,
+    smooth_mix: smoothMix,
+    noise_window_days: noiseWindowDays,
+    noise_target_pct: noiseTargetPct,
+    noise_sensitivity: noiseSensitivity,
+    curve_sensitivity: curveSensitivity,
+    curve_trend_days: curveTrendDays,
+    curve_slope_pct: curveSlopePct,
+    curve_curv_pct: curveCurvPct
   };
 }
 
@@ -1578,7 +1959,7 @@ const SIZE_HIGH = "HIGH";
 function _sizeFromScore(score) {
   if (!isFinite(score) || score <= 0) return null;
   if (score < 0.60) return SIZE_LOW;
-  if (score < 1.40) return SIZE_MED;
+  if (score < 3) return SIZE_MED;
   return SIZE_HIGH;
 }
 
@@ -1663,6 +2044,62 @@ function computeRegimeAtIndex(prices, i, baseParams) {
     posInRange,
     regimeRangePct
   };
+}
+function buildSignalSeries(prices, params) {
+  const method = String(params.smoothing_method || params.smoothingMethod || SMOOTH_METHOD_DEFAULT).toLowerCase();
+
+  const alphaBase = clamp(
+    (typeof (params.smoothing_alpha_base ?? params.smoothingAlphaBase) === "number"
+      ? (params.smoothing_alpha_base ?? params.smoothingAlphaBase)
+      : SMOOTH_ALPHA_BASE_DEFAULT),
+    0.05, 0.95
+  );
+  const minA = clamp(
+    (typeof (params.smoothing_min_alpha ?? params.smoothingMinAlpha) === "number"
+      ? (params.smoothing_min_alpha ?? params.smoothingMinAlpha)
+      : SMOOTH_MIN_ALPHA_DEFAULT),
+    0.05, alphaBase
+  );
+  const maxA = clamp(
+    (typeof (params.smoothing_max_alpha ?? params.smoothingMaxAlpha) === "number"
+      ? (params.smoothing_max_alpha ?? params.smoothingMaxAlpha)
+      : SMOOTH_MAX_ALPHA_DEFAULT),
+    alphaBase, 0.95
+  );
+
+  const noiseLB = (typeof (params.smoothing_noise_lookback_days ?? params.smoothingNoiseLookbackDays) === "number"
+    ? Math.floor(params.smoothing_noise_lookback_days ?? params.smoothingNoiseLookbackDays)
+    : SMOOTH_NOISE_LOOKBACK_DAYS_DEFAULT);
+
+  const rigidity = (typeof (params.smoothing_rigidity_pct ?? params.smoothingRigidityPct) === "number"
+    ? (params.smoothing_rigidity_pct ?? params.smoothingRigidityPct)
+    : SMOOTH_RIGIDITY_PCT_DEFAULT);
+
+  const adapt = (typeof (params.smoothing_adapt_strength ?? params.smoothingAdaptStrength) === "number"
+    ? (params.smoothing_adapt_strength ?? params.smoothingAdaptStrength)
+    : SMOOTH_ADAPT_STRENGTH_DEFAULT);
+
+  const sig = new Array(prices.length);
+  const noise = new Array(prices.length);
+  sig[0] = prices[0];
+  noise[0] = 0;
+
+  for (let i = 1; i < prices.length; i++) {
+    const p = prices[i];
+    const nPct = avgAbsReturnPct(prices, i, noiseLB);
+    noise[i] = nPct;
+
+    if (method === "ema") {
+      const ratio = rigidity > 0 ? (nPct / rigidity) : 0;
+      const shrink = ratio > 1 ? (1 / (1 + adapt * (ratio - 1))) : 1;
+      const a = clamp(alphaBase * shrink, minA, maxA);
+      sig[i] = a * p + (1 - a) * sig[i - 1];
+    } else {
+      sig[i] = p;
+    }
+  }
+
+  return { sig, noiseLB, rigidity, adapt };
 }
 
 function computeSignalSizedDecision(prices, bestParams, portfolioSnap = null) {
@@ -2494,6 +2931,17 @@ function saveBestResult(symbol, result, { mode = MODE_PRECISE, calcUsed = "" } =
     last_amount: result.last_amount,
     last_action_price: result.last_action_price,
     last_price: result.last_price,
+    smoothing_method: result.smoothing_method || SMOOTH_METHOD_DEFAULT,
+    smoothing_alpha_base: (typeof result.smoothing_alpha_base === "number" ? result.smoothing_alpha_base : SMOOTH_ALPHA_BASE_DEFAULT),
+    smoothing_min_alpha:  (typeof result.smoothing_min_alpha  === "number" ? result.smoothing_min_alpha  : SMOOTH_MIN_ALPHA_DEFAULT),
+    smoothing_max_alpha:  (typeof result.smoothing_max_alpha  === "number" ? result.smoothing_max_alpha  : SMOOTH_MAX_ALPHA_DEFAULT),
+    smoothing_noise_lookback_days: (typeof result.smoothing_noise_lookback_days === "number" ? result.smoothing_noise_lookback_days : SMOOTH_NOISE_LOOKBACK_DAYS_DEFAULT),
+    smoothing_rigidity_pct: (typeof result.smoothing_rigidity_pct === "number" ? result.smoothing_rigidity_pct : SMOOTH_RIGIDITY_PCT_DEFAULT),
+    smoothing_adapt_strength: (typeof result.smoothing_adapt_strength === "number" ? result.smoothing_adapt_strength : SMOOTH_ADAPT_STRENGTH_DEFAULT),
+
+    noise_penalty_strength: (typeof result.noise_penalty_strength === "number" ? result.noise_penalty_strength : NOISE_PENALTY_STRENGTH_DEFAULT),
+    curve_lookback_days: (typeof result.curve_lookback_days === "number" ? result.curve_lookback_days : CURVE_LOOKBACK_DAYS_DEFAULT),
+    curve_weight: (typeof result.curve_weight === "number" ? result.curve_weight : CURVE_WEIGHT_DEFAULT),
 
     // Debug/extra: keep last EXECUTED trade from the backtest (wallet-dependent)
     exec_last_decision: result.exec_last_decision || null,
@@ -2832,7 +3280,7 @@ async function runForInput(
     const wl = computeAvgWinLossFromMarkers(prices, buyMarkers, sellMarkers);
     if (wl && (isFinite(wl.avgWinPct) || isFinite(wl.avgLossPct))) {
       const fmtPct = (v) =>
-        (typeof v === "number" && isFinite(v)) ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "–";
+        (typeof v === "number" && isFinite(v)) ? `${v.toFixed(2)}%` : "–";
 
       // store for debugging / future UI use
       bestResult.avg_win_pct = wl.avgWinPct;
@@ -2842,7 +3290,7 @@ async function runForInput(
 
       decisionExtra.innerHTML =
         `<div>$${bestResult.last_price.toFixed(2)}</div>` +
-        `<div style="opacity:0.9; font-size:0.75rem;">Avg win: ${fmtPct(wl.avgWinPct)} • Avg loss: ${fmtPct(wl.avgLossPct)}</div>`;
+        `<div style="opacity:0.9; font-size:0.75rem;">Avg win: ${fmtPct(wl.avgWinPct)} • Avg loss: ${fmtPct(Math.abs(wl.avgLossPct))}</div>`;
     } else {
       // fallback
       decisionExtra.textContent = `$${bestResult.last_price.toFixed(2)}`;
